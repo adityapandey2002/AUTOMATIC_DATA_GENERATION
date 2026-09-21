@@ -13,7 +13,9 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-# ---------------------------------------------------------------- helpers
+# Devanagari-safe boundary: \b fails after matras (combining marks are non-word).
+# Instead require the next char to be space, punctuation or end-of-string.
+BD = r"(?=\s|[.?,।;]|$)"
 
 HINDI_MONTHS = {
     "जनवरी": 1, "फ़रवरी": 2, "फरवरी": 2, "मार्च": 3, "अप्रैल": 4,
@@ -37,9 +39,13 @@ HINDI_WORDS = {
     "सैंतीस": 37, "अड़तीस": 38, "उनतालीस": 39, "चालीस": 40,
     "इकतालीस": 41, "बयालीस": 42, "तैंतालीस": 43, "चौवालीस": 44,
     "पैंतालीस": 45, "छियालीस": 46, "सैंतालीस": 47, "अड़तालीस": 48,
-    "उनचास": 49, "पचास": 50, "साठ": 60, "सत्तर": 70, "अस्सी": 80, "नब्बे": 90,
+    "उनचास": 49, "पचास": 50, "पचपन": 55, "साठ": 60, "सत्तर": 70,
+    "अस्सी": 80, "नब्बे": 90,
 }
-TEN_PLUS = {w for w, n in HINDI_WORDS.items() if n >= 21}
+
+QUESTION_TOKENS = re.compile(
+    r"^(क्या|कितनी|कितना|कितने|बताइए|बताईए|बताए|बताएए|बताओ|कौन|कहाँ|कहां|है|हो|था|थी|थे)$"
+)
 
 
 def _to_int(text: str) -> Optional[float]:
@@ -54,7 +60,7 @@ def _to_int(text: str) -> Optional[float]:
         return HINDI_WORDS[tokens[0]]
     total = 0
     for t in tokens:
-        w = t.replace("़", "").replace("ों", "ो")
+        w = t.replace("़", "")
         if w in HINDI_WORDS:
             total += HINDI_WORDS[w]
     return total or None
@@ -65,41 +71,24 @@ def _clean_capture(s: str) -> str:
 
 
 def _last(text: str, pattern: str) -> Optional[str]:
-    """Match an answer AFTER the question — the patient's eply usually comes
-    after the worker's question, so the LAST match is the answer."""
+    """The patient's answer usually comes AFTER the question, so the LAST
+    match is more likely the answer. Drop pure-question tokens."""
     matches = list(re.finditer(pattern, text))
     if not matches:
         return None
     value = _clean_capture(matches[-1].group(1))
-    if not value:
-        return None
-    if re.fullmatch(r"(क्या|कितनी|कितना|बताइए|बताईए|है|हो|था|थी)", value):
+    if not value or QUESTION_TOKENS.fullmatch(value):
         return None
     return value
-
-
-# ---------------------------------------------------------------- rules
-
-def _extract_after_question(text: str, question_words: tuple) -> Optional[str]:
-    """Find the answer that immediately follows a known question."""
-    for q in question_words:
-        idx = text.find(q)
-        if idx == -1:
-            continue
-        tail = text[idx + len(q):]
-        m = re.search(r"([^?.।]{2,60}?)(?:\s*[?.।]|$)", tail)
-        if m:
-            return _clean_capture(m.group(1))
-    return None
 
 
 def local_fill(transcript: str) -> dict:
     """Return lightweight {field_key: value} from the transcript."""
     text = transcript or ""
+    text = text.replace("गाँव", "गांव")
     result: dict[str, Any] = {}
-    t = text  # keep original (Devanagari)
 
-    # --- phone: 10-digit sequence -----------------------------------------
+    # --- phone: 10-digit sequence ----------------------------------------
     m = re.search(r"(?<!\d)([6-9]\d{9})(?!\d)", text.replace(" ", "")) or \
         re.search(r"(?<!\d)(\d{3}\s*\d{3}\s*\d{4})(?!\d)", text)
     if m:
@@ -110,23 +99,27 @@ def local_fill(transcript: str) -> dict:
     if m:
         result["aadhaar_number"] = re.sub(r"\s+", "", m.group(1))
 
-    # --- name -------------------------------------------------------------
+    # --- name (skip other people's names + question words) -----------------
     name = None
     for m in re.finditer(
-        r"नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है\b|\s*[.?।]|$)", text
+        r"नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है" + BD + r"|\s*[.?।]|$)", text
     ):
         value = _clean_capture(m.group(1))
-        if re.fullmatch(r"(क्या|कितनी|कितना|बताइए|बताईए|बताए|बताएए|कौन|कहाँ)", value):
+        if QUESTION_TOKENS.fullmatch(value):
             continue
         ctx = text[max(0, m.start() - 12):m.start()]
         if re.search(r"(पति|पती|पिता|का\s*\w*$)", ctx):
-            continue  # someone else's name — skip
+            continue  # someone else's name
         name = value
     if name:
         result["name"] = name
 
     # --- spouse / father --------------------------------------------------
-    value = _last(text, r"(?:पति|पती)\s*का\s*नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है\b|\s*[.?।]|$)")
+    value = _last(
+        text,
+        r"(?:पति|पती)\s*का\s*नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है"
+        + BD + r"|\s*[.?।]|$)",
+    )
     if value:
         result["spouse_parent_of"] = value
 
@@ -139,38 +132,64 @@ def local_fill(transcript: str) -> dict:
             result["age"] = int(val)
 
     # --- block / district / village ----------------------------------------
-    value = _last(text, r"ब्लॉक\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+है|\s+जिला|$)")
+    value = _last(
+        text,
+        r"ब्लॉक\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+है"
+        + BD + r"|\s+जिला|$)",
+    )
     if value:
         result["block"] = value
-    value = _last(text, r"जिला\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+है|$)")
+    value = _last(
+        text,
+        r"जिला\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+है"
+        + BD + r"|$)",
+    )
     if value:
         result["district"] = value
-    value = _last(text, r"(?:गाँव|गांव|गाव|ग्राम)\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+ब्लॉक|\s+जिला|\s+है|$)")
+    value = _last(
+        text,
+        r"(?:गांव|गाव|ग्राम)\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*[,.?।]|\s+ब्लॉक|\s+जिला|\s+है"
+        + BD + r"|$)",
+    )
     village = value
     bits = [b for b in (village, result.get("block"), result.get("district")) if b]
     if bits:
         result["address"] = ", ".join(bits)
-    value = _last(text, r"पता\s*[:]?\s*([\u0900-\u097F\w\s-]{2,80}?)(?:\s*है\b|\s*[.?।]|$)")
+    value = _last(
+        text,
+        r"पता\s*[:]?\s*([\u0900-\u097F\w\s-]{2,80}?)(?:\s*है" + BD + r"|\s*[.?।]|$)",
+    )
     if value and "address" not in result:
         result["address"] = value
 
     # --- ASHA --------------------------------------------------------------
-    value = _last(text, r"आशा\s*का\s*नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है\b|\s*[.?।]|$)")
+    value = _last(
+        text,
+        r"आशा\s*का\s*नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है"
+        + BD + r"|\s*[.?।]|$)",
+    )
     if value:
         result["asha_name"] = value
 
     # --- health centre -----------------------------------------------------
-    value = _last(text, r"(?:स्वास्थ्य\s*)?केन्द्र\s*[:]?\s*([\u0900-\u097F\w\s-]{2,50}?)(?:\s*है\b|\s*[.?।]|$)")
+    value = _last(
+        text,
+        r"(?:स्वास्थ्य\s*)?केन्द्र\s*[:]?\s*([\u0900-\u097F\w\s-]{2,50}?)(?:\s*है"
+        + BD + r"|\s*[.?।]|$)",
+    )
     if value:
         result["health_centre"] = value
 
     # --- LMP ---------------------------------------------------------------
-    m = re.search(r"(?:अंतिम|आखिरी|एलएमपी|LMP)\s*मासिक\s*धर्म\s*[:]?\s*(\d{1,2})?\s*([\u0900-\u097F]+)", text)
+    m = re.search(
+        r"(?:अंतिम|आखिरी|एलएमपी|LMP)\s*मासिक\s*धर्म\s*[:]?\s*(\d{1,2})?\s*([\u0900-\u097F]{2,12})",
+        text,
+    )
     if m:
         day = _to_int(m.group(1)) if m.group(1) else None
-        month = m.group(2)
-        for name, num in HINDI_MONTHS.items():
-            if name in month:
+        month_str = m.group(2)
+        for mname, num in HINDI_MONTHS.items():
+            if mname in month_str:
                 if day:
                     result["lmp"] = f"2026-{num:02d}-{int(day):02d}"
                 break
@@ -178,38 +197,65 @@ def local_fill(transcript: str) -> dict:
     if m and "lmp" not in result:
         result["lmp"] = f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
 
-    # --- Yes/No fields --------------------------------------------------------
+    # --- Yes/No fields -----------------------------------------------------
     def yesno_after(question_hint: str):
         idx = text.find(question_hint)
         if idx == -1:
             return None
-        region = text[idx: idx + 140]
-        if re.search(r"(नहीं\b|नहि\b|no\b)", region, re.IGNORECASE):
-            return "No"
-        if re.search(r"(हाँ|हा\b|जी\s*हाँ|हो\s*गई|हुआ|हुई|yes\b)", region, re.IGNORECASE):
-            return "Yes"
-        return None
+        tail = text[idx:]
+        events = []  # (position, Y/N); the LAST one decides
+        for m in re.finditer(r"नहीं" + BD, tail):
+            events.append((m.start(), "N"))
+        for m in re.finditer(r"हाँ" + BD + r"|जी\s*हाँ", tail):
+            events.append((m.start(), "Y"))
+        for m in re.finditer(r"हो\s*गई|हो\s*गया|हुई|हुआ|हुआ", tail):
+            ctx = tail[max(0, m.start() - 8):m.start()]
+            events.append((m.start(), "N" if "नहीं" in ctx else "Y"))
+        if not events:
+            return None
+        return "Yes" if events[-1][1] == "Y" else "No"
 
+    # ANC — "एएनसी/जांच ... हाँ/हो गई" -> anc_checkup_done (+ visit count)
     for hint, key in (
-        ("एएनसी", "pregnancy_complication"),
-        ("एनसी", "pregnancy_complication"),
-        ("एन.सी", "pregnancy_complication"),
+        ("एएनसी", "anc_checkup_done"),
+        ("एनसी", "anc_checkup_done"),
+        ("एन. सी", "anc_checkup_done"),
+        ("एन.सी", "anc_checkup_done"),
+    ):
+        val = yesno_after(hint)
+        if val:
+            result.setdefault(key, val)
+    for hint in ("एएनसी", "एनसी", "एन. सी", "एन.सी"):
+        idx = text.find(hint)
+        if idx != -1:
+            region = text[idx: idx + 120]
+            m = None
+            for fm in re.finditer(r"(\d{1,2}\s*bार|\d{1,2}\s*visits|visits\s*\d{1,2}|([\u0900-\u097F]{2,10})\s*बार)", region, re.IGNORECASE):
+                m = fm
+            if m:
+                grp = m.group(1) or m.group(2)
+                val = _to_int(grp)
+                if val and 0 <= val <= 20:
+                    result["anc_visits"] = int(val)
+                    break
+
+    # Complications only from explicit complication wording (not ANC).
+    for hint, key in (
         ("जटिलता", "pregnancy_complication"),
-        ("जाँच", "pregnancy_complication"),
-        ("जांच", "pregnancy_complication"),
+        ("परेशानी", "pregnancy_complication"),
     ):
         val = yesno_after(hint)
         if val:
             result.setdefault(key, val)
 
-    # --- baby / delivery keywords ---------------------------------------------
+    # --- baby / delivery keywords -------------------------------------------
     if re.search(r"सामान्य\s*प्रसव|सामान्य", text):
         result.setdefault("delivery_mode", "Normal")
     if re.search(r"सीज़ेरियन|सिजेरियन|सिजेरियन|caesarean|cesarean", text, re.IGNORECASE):
         result["delivery_mode"] = "Caesarean"
     if re.search(r"जीवित\s*बच्चा|जीवित", text):
         result.setdefault("delivery_outcome", "Live birth")
-    if re.search(r"स्टिल\s*बर्थ|मृत\s*जन्म", text):
+    if re.search(r"स्टिल\s*बर्थ|मृत\s*जन्म|stillbirth", text, re.IGNORECASE):
         result["delivery_outcome"] = "Stillbirth"
     if re.search(r"लड़का|बेटा|बालक", text):
         result.setdefault("baby_sex", "Boy")
@@ -237,7 +283,7 @@ def local_fill(transcript: str) -> dict:
     if shots:
         result["immunization"] = shots
 
-    # --- marital status -----------------------------------------------------
+    # --- marital status ----------------------------------------------------
     if re.search(r"विवाहि|शादीशुदा|married", text, re.IGNORECASE):
         result["marital_status"] = "Married"
     elif re.search(r"(अविवाहित|unmarried)", text, re.IGNORECASE):

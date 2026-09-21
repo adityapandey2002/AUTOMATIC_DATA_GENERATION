@@ -28,7 +28,8 @@ from engine.merge import MergeEngine
 from engine.validate import validate_case_sheet
 from engine.local_fill import local_fill
 from db.connection import SessionLocal
-from db.models import Encounter, Utterance, VitalsSnapshot, Alert
+from db.models import Encounter, Utterance, VitalsSnapshot, Alert, Patient
+from sqlalchemy import delete as sa_delete
 from storage.audio import log_deletion
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,10 @@ class ChunkSession:
         return self.merge.confirm(field_name)
 
     def _persist(self, db, snapshot: dict, alerts) -> None:
+        # Idempotent: a repeat finalize (same encounter_id) replaces old rows.
+        if self.encounter_id:
+            for model in (Utterance, VitalsSnapshot, Alert, Patient, Encounter):
+                db.execute(sa_delete(model).where(model.encounter_id == self.encounter_id) if hasattr(model, "encounter_id") else sa_delete(model).where(model.id == self.encounter_id))
         encounter = Encounter(id=self.encounter_id or None)
         db.add(encounter)
         db.flush()
@@ -234,6 +239,7 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
             if data.get("type") == "finalize":
                 session.encounter_id = data.get("encounter_id", session.encounter_id)
                 result = await session.finalize()
+                await websocket.send_text(json.dumps(result))
                 await broadcast_to_dashboard(result)
                 session.active = False
                 break

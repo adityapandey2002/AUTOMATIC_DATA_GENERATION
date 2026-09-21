@@ -49,9 +49,16 @@ async def main():
         resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=120))
         print("=== transcript ===")
         print(resp.get("transcript", ""))
-        print("=== filled answers ===")
+        print("=== filled answers (live) ===")
         filled = {k: v for k, v in (resp.get("answers") or {}).items() if v not in (None, "")}
         print(json.dumps(filled, indent=2, ensure_ascii=False))
+
+        await ws.send(json.dumps({"type": "finalize"}))
+        fin = json.loads(await asyncio.wait_for(ws.recv(), timeout=120))
+        print("=== finalize_result answers ===")
+        final = {k: v for k, v in (fin.get("answers") or {}).items() if v not in (None, "")}
+        print(json.dumps(final, indent=2, ensure_ascii=False))
+        print("alerts:", fin.get("alerts"))
 
 
 if __name__ == "__main__":

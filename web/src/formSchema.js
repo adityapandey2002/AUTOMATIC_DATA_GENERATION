@@ -59,6 +59,8 @@ export const FORM_SCHEMA = {
         { key: "lmp", label_en: "LMP", label_hi: "एलएमपी", type: "date" },
         { key: "edd", label_en: "EDD", label_hi: "ईडीडी", type: "date" },
         { key: "pregnancy_complication", label_en: "Came with pregnancy-related complication", label_hi: "गर्भावस्था से संबंधित जटिलता के साथ उपस्थित", type: "yesno" },
+        { key: "anc_checkup_done", label_en: "ANC checkup done", label_hi: "एएनसी जांच हुई", type: "yesno" },
+        { key: "anc_visits", label_en: "Number of ANC visits", label_hi: "एएनसी जांचों की संख्या", type: "number" },
         { key: "provisional_diagnosis", label_en: "Provisional Diagnosis", label_hi: "अस्थायी निदान", type: "text", wide: true },
         { key: "final_diagnosis", label_en: "Final Diagnosis", label_hi: "अंतिम निदान", type: "text", wide: true },
         { key: "contraceptive_history", label_en: "Contraceptive Use History", label_hi: "गर्भ निरोधन प्रयोग का इतिहास", type: "text", wide: true },
