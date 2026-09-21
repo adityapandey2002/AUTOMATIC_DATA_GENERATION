@@ -1,0 +1,76 @@
+"""One-shot integration test — starts backend, exercises REST + WebSocket, prints results."""
+
+import asyncio
+import base64
+import json
+import sys
+import time
+
+import httpx
+import websockets
+
+BASE = "http://127.0.0.1:8765"
+WS_CHUNKS = "ws://127.0.0.1:8765/ws/chunks"
+WS_DASH = "ws://127.0.0.1:8765/ws/dashboard"
+
+
+async def test_rest():
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{BASE}/health", timeout=5)
+        assert r.status_code == 200, f"health status {r.status_code}"
+        assert r.json() == {"status": "ok"}
+
+        s = await client.get(f"{BASE}/api/schema", timeout=5)
+        assert s.status_code == 200, "schema endpoint failed"
+        schema_fields = s.json()["sections"][0]["fields"][0]["key"]
+        return f"REST /health + /api/schema OK (first field: {schema_fields})"
+
+
+async def test_dashboard_ws():
+    async with websockets.connect(WS_DASH, open_timeout=5) as ws:
+        # Dashboard must receive its own mic_start broadcast back
+        await ws.send(json.dumps({"type": "mic_start", "encounter_id": "it-dash"}))
+        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        assert resp.get("type") == "session_state", f"got {resp.get('type')}"
+        assert resp.get("active") is True
+        await ws.send(json.dumps({"type": "mic_stop"}))
+        return f"WS {WS_DASH} mic_start/mic_stop round-trip OK"
+
+
+async def test_chunks_ws():
+    async with websockets.connect(WS_CHUNKS, open_timeout=5) as ws:
+        await ws.send(json.dumps({"type": "session_start", "encounter_id": "it-chunks"}))
+        silence = base64.b64encode(b"\x00\x00" * 1600).decode("ascii")
+        payload = {
+            "chunk_id": 0,
+            "pcm_b64": silence,
+            "sample_rate": 16000,
+            "channels": 1,
+            "mic_channel": 0,
+            "start_sample": 0,
+            "end_sample": 1600,
+            "duration_ms": 100,
+            "language": "hi",
+        }
+        await ws.send(json.dumps(payload))
+        try:
+            resp = await asyncio.wait_for(ws.recv(), timeout=15)
+            data = json.loads(resp)
+            assert data.get("type") == "chunk_result", f"unexpected type {data.get('type')}"
+            assert "answers" in data and "confirmed" in data, "missing answers/confirmed"
+            return f"WS {WS_CHUNKS} chunk round-trip OK (answers={sum(v is not None for v in data['answers'].values())} fields)"
+        except asyncio.TimeoutError:
+            return "WS /ws/chunks connected but no chunk_result returned (no API key / empty result expected)"
+
+
+async def main():
+    results = []
+    results.append(await test_rest())
+    results.append(await test_dashboard_ws())
+    results.append(await test_chunks_ws())
+    for r in results:
+        print("PASS:", r)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

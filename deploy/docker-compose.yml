@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ambient_scribe
+      POSTGRES_USER: scribe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scribe_dev_2024}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scribe -d ambient_scribe"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql://scribe:${POSTGRES_PASSWORD:-scribe_dev_2024}@postgres:5432/ambient_scribe
+      WS_HOST: "0.0.0.0"
+      WS_PORT: "8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:

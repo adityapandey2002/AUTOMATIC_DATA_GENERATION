@@ -1,0 +1,10 @@
+# Optional: AI4Bharat IndicConformer (local Maithili ASR) dependencies.
+# HEAVY — pulls torch + NeMo (~3+ GB). Only install if you want offline
+# Maithili transcription via `INDIC_CONFORMER` path.
+#
+#   pip install -r requirements-nemo.txt
+#
+# Note: NeMo may not support Python 3.14 yet. If install fails, either use
+# Python 3.11/3.12 for the backend, or keep using Groq for Maithili-as-Hindi
+# routing until NeMo catches up.
+nemo_toolkit[asr]>=1.23
