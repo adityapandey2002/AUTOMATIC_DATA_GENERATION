@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useWebSocket } from "./hooks/useWebSocket";
+import { useBrowserMic } from "./hooks/useBrowserMic";
 import TranscriptPanel from "./components/TranscriptPanel";
 import CaseSheetForm from "./components/CaseSheetForm";
 import AlertBanner from "./components/AlertBanner";
@@ -24,7 +25,24 @@ export default function App() {
   const [recording, setRecording] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
   const [elapsed, setElapsed] = useState("");
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const [captureConnected, setCaptureConnected] = useState(false);
   const timerRef = useRef(null);
+  const voiceTimerRef = useRef(null);
+  const encounterIdRef = useRef("");
+
+  const { start: startMic, stop: stopMic, error: micError } = useBrowserMic({
+    language: "hi",
+    onLevel: (level) => {
+      setVoiceLevel(level);
+      if (level > 0) {
+        setVoiceActive(true);
+        if (voiceTimerRef.current) clearTimeout(voiceTimerRef.current);
+        voiceTimerRef.current = setTimeout(() => setVoiceActive(false), 1500);
+      }
+    },
+  });
 
   useEffect(() => {
     fetch("/api/schema")
@@ -49,11 +67,32 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [recording, startedAt]);
 
+  useEffect(() => () => clearTimeout(voiceTimerRef.current), []);
+
+  useEffect(() => {
+    if (micError && recording) {
+      stopMic();
+      setRecording(false);
+      setStartedAt(null);
+    }
+  }, [micError, recording, stopMic]);
+
   useEffect(() => {
     if (!lastMessage) return;
 
+    if (lastMessage.type === "voice_activity") {
+      setVoiceActive(true);
+      if (voiceTimerRef.current) clearTimeout(voiceTimerRef.current);
+      voiceTimerRef.current = setTimeout(() => setVoiceActive(false), 1500);
+    }
+
+    if (lastMessage.type === "capture_status") {
+      setCaptureConnected(Boolean(lastMessage.connected));
+    }
+
     if (lastMessage.type === "session_state") {
       setRecording(Boolean(lastMessage.active));
+      if (!lastMessage.active) setVoiceActive(false);
       if (lastMessage.active) {
         setMessages([]);
         setAnswers({});
@@ -100,6 +139,7 @@ export default function App() {
       setRecording(false);
       setStartedAt(null);
       setElapsed("");
+      setVoiceActive(false);
     }
   }, [lastMessage]);
 
@@ -113,20 +153,23 @@ export default function App() {
 
   const handleMic = useCallback(() => {
     if (recording) {
-      send({ type: "mic_stop" });
+      stopMic();
       setRecording(false);
       setStartedAt(null);
+      setVoiceActive(false);
+      setVoiceLevel(0);
     } else {
       const encounterId = uuid();
+      encounterIdRef.current = encounterId;
       setMessages([]);
       setAnswers({});
       setConfirmed({});
       setAlerts([]);
-      send({ type: "mic_start", encounter_id: encounterId });
       setRecording(true);
       setStartedAt(Date.now());
+      startMic(encounterId);
     }
-  }, [recording, send]);
+  }, [recording, startMic, stopMic]);
 
   const filledCount = Object.values(answers ?? {}).filter(
     (v) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0)
@@ -208,6 +251,11 @@ export default function App() {
       </header>
 
       {/* Alerts */}
+      {micError && (
+        <div className="mx-5 mt-3 rounded-xl bg-red-50 ring-1 ring-red-300 px-4 py-2.5 text-sm font-semibold text-red-700 shadow-sm">
+          🎙 {micError}
+        </div>
+      )}
       <div className="px-5 pt-3">
         <AlertBanner alerts={alerts} />
       </div>
@@ -215,7 +263,15 @@ export default function App() {
       {/* Main */}
       <div className="flex-1 min-h-0 p-5 grid grid-cols-1 xl:grid-cols-[2fr_3fr] gap-5">
         <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
-          <TranscriptPanel messages={messages} liveCount={filledCount} />
+          <TranscriptPanel
+            messages={messages}
+            liveCount={filledCount}
+            voiceActive={voiceActive}
+            voiceLevel={voiceLevel}
+            captureConnected={captureConnected || recording}
+            recording={recording}
+            micError={micError}
+          />
         </div>
 
         <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">

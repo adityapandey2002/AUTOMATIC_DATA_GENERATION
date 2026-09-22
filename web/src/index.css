@@ -32,6 +32,24 @@ body {
   animation: fade-up 0.35s ease-out both;
 }
 
+@keyframes eq-bar {
+  0%, 100% { transform: scaleY(0.25); }
+  50% { transform: scaleY(1); }
+}
+
+.eq-idle {
+  height: 28px;
+  transform-origin: bottom;
+  transform: scaleY(0.25);
+}
+
+.animate-eq {
+  height: 28px;
+  transform-origin: bottom;
+  transform: scaleY(0.25);
+  animation: eq-bar 0.8s ease-in-out infinite;
+}
+
 .scrollbar-thin::-webkit-scrollbar {
   width: 6px;
 }

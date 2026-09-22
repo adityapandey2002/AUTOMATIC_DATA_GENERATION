@@ -18,12 +18,23 @@ const SPEAKER_LABEL = {
   unknown: "Speaker",
 };
 
-export default function TranscriptPanel({ messages, liveCount = 0 }) {
+export default function TranscriptPanel({
+  messages,
+  liveCount = 0,
+  voiceActive = false,
+  voiceLevel = 0,
+  captureConnected = false,
+  recording = false,
+  micError = "",
+}) {
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
+
+  const waveBars = [0, 1, 2, 3, 4, 5, 6];
+  const maxHeight = 28;
 
   return (
     <div className="flex flex-col h-full">
@@ -34,29 +45,67 @@ export default function TranscriptPanel({ messages, liveCount = 0 }) {
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
             {messages.length === 0
-              ? "Waiting for audio..."
+              ? voiceActive
+                ? "Audio detected — transcribing…"
+                : "Waiting for audio..."
               : `${messages.length} segment${messages.length === 1 ? "" : "s"} transcribed`}
           </p>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-500">
-            <span className="w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse-dot" />
-            {liveCount > 0 ? `${liveCount} fields detected` : "listening"}
-          </span>
+          {voiceActive ? (
+            <span className="flex items-center gap-1.5 text-[10px] font-bold text-red-500">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse-dot" />
+              Hearing…
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-500">
+              <span className="w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse-dot" />
+              {recording && !captureConnected
+                ? "Capture agent not connected"
+                : liveCount > 0
+                ? `${liveCount} fields detected`
+                : "listening"}
+            </span>
+          )}
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto scrollbar-thin px-5 py-4 space-y-4 bg-gradient-to-b from-white to-slate-50/70">
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center">
-            <div className="w-14 h-14 rounded-2xl bg-brand-50 ring-1 ring-brand-100 flex items-center justify-center mb-3">
-              <svg className="w-7 h-7 text-brand-400 animate-pulse-dot" fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
-              </svg>
+            <div
+              className={`w-14 h-14 rounded-2xl ring-1 flex items-center justify-center mb-3 transition-colors ${
+                voiceActive ? "bg-red-50 ring-red-100" : "bg-brand-50 ring-brand-100"
+              }`}
+            >
+              <div className="flex items-end gap-1 h-8">
+                {waveBars.map((i) => {
+                  const offset = Math.sin((i / waveBars.length) * Math.PI);
+                  const height = voiceActive
+                    ? Math.max(6, maxHeight * (0.15 + 0.85 * voiceLevel * offset))
+                    : 7;
+                  return (
+                    <span
+                      key={i}
+                      className="w-1.5 rounded-full bg-brand-400 transition-all duration-150"
+                      style={{
+                        height: `${height}px`,
+                        animationDelay: `${i * 0.11}s`,
+                      }}
+                    />
+                  );
+                })}
+              </div>
             </div>
-            <p className="text-sm font-semibold text-slate-500">Waiting for audio…</p>
+            <p className="text-sm font-semibold text-slate-500">
+              {voiceActive ? "Hearing…" : "Waiting for audio…"}
+            </p>
             <p className="text-xs text-slate-400 mt-1">
-              Speak to the microphone — the transcript will appear here in real time.
+              {micError
+                ? micError
+                : recording
+                ? "Speak now — transcribing your voice in real time."
+                : "Press Start Recording and speak to the microphone."}
             </p>
           </div>
         )}

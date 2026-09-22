@@ -52,7 +52,7 @@ class SarvamASR:
 
         try:
             pcm = base64.b64decode(pcm_b64)
-            wav_bytes = _pcm_bytes_to_wav(pcm, sample_rate=sample_rate, channels=1)
+            wav_bytes = _pcm_bytes_to_wav(pcm, sample_rate=16000, channels=1)
         except Exception as e:
             logger.error("Sarvam: could not decode audio chunk: %s", e)
             return {"text": "", "speaker": "unknown", "confidence": 0.0}
@@ -64,7 +64,7 @@ class SarvamASR:
         files = {
             "file": ("chunk.wav", wav_bytes, "audio/wav"),
             "language_code": (None, language),
-            "model": (None, model),
+            "model": (None, "saaras:v3"),
             "mode": (None, "transcribe"),
             "with_timestamps": (None, "false"),
             "with_diarization": (None, "true"),

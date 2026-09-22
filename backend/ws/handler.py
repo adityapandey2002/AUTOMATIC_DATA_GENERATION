@@ -11,8 +11,11 @@ each auto-filled field before it locks.
 
 from __future__ import annotations
 
+import array
+import base64
 import json
 import logging
+import math
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -210,7 +213,27 @@ class ChunkSession:
 # --- Connection registries -------------------------------------------------
 
 dashboard_clients: set[WebSocket] = set()
+capture_clients: set[WebSocket] = set()
 current_session: Optional[ChunkSession] = None
+
+
+def _pcm_level(pcm_b64: str) -> float:
+    """Rough RMS voice level (0..1) for a base64 PCM16 chunk."""
+    try:
+        samples = array.array("h", base64.b64decode(pcm_b64))
+        if not samples:
+            return 0.0
+        rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+        return min(1.0, rms / 5000.0)
+    except Exception:
+        return 0.0
+
+
+async def broadcast_capture_status() -> None:
+    await broadcast_to_dashboard({
+        "type": "capture_status",
+        "connected": bool(capture_clients),
+    })
 
 
 async def broadcast_to_dashboard(message: dict) -> None:
@@ -228,6 +251,8 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
     """Capture-agent endpoint. Runs ASR -> extraction and broadcasts live."""
     global current_session
     await websocket.accept()
+    capture_clients.add(websocket)
+    await broadcast_capture_status()
     session = ChunkSession()
     current_session = session
 
@@ -254,10 +279,30 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
             if "encounter_id" in data:
                 session.encounter_id = data["encounter_id"]
 
+            # First audio chunk implicitly starts the session (the capture agent
+            # does not send session_start), so chunks are never dropped.
+            if not session.active:
+                session.active = True
+                session.reset(session.encounter_id)
+                await broadcast_to_dashboard({
+                    "type": "session_state",
+                    "active": True,
+                    "encounter_id": session.encounter_id,
+                })
+
+            voice_level = _pcm_level(data.get("pcm_b64", ""))
+            await broadcast_to_dashboard({
+                "type": "voice_activity",
+                "level": voice_level,
+                "encounter_id": session.encounter_id,
+            })
+
             result = await session.process_chunk(data)
             if result is None:
                 # Not recording — drain silently so the agent keeps its socket.
                 continue
+            result["voice_level"] = voice_level
+            result["vad"] = 1.0 if voice_level > 0.02 else 0.0
             await websocket.send_text(json.dumps(result))
             await broadcast_to_dashboard(result)
 
@@ -266,6 +311,8 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
     except Exception as e:
         logger.error("Chunks WebSocket error: %s", e)
     finally:
+        capture_clients.discard(websocket)
+        await broadcast_capture_status()
         if current_session is session:
             current_session = None
         session.active = False
@@ -293,6 +340,7 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
                 "confirmed": snapshot["_confirmed"],
                 "transcript": " ".join(current_session.transcript_buffer[-8:]),
             }))
+        await broadcast_capture_status()
 
         while True:
             raw = await websocket.receive_text()
