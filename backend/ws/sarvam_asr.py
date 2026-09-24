@@ -20,6 +20,16 @@ SARVAM_ASR_URL = "https://api.sarvam.ai/speech-to-text"
 
 _PLACEHOLDER_KEYS = {"", "your_sarvam_api_key", "YOUR_SARVAM_API_KEY"}
 
+# Internal lang tags -> Sarvam BCP-47 codes (required; "hi" alone is rejected).
+LANG_MAP = {
+    "hi": "hi-IN",
+    "hindi": "hi-IN",
+    "mai": "mai-IN",
+    "mag": "mag-IN",
+    "bho": "bho-IN",
+    "en": "en-IN",
+}
+
 
 def _pcm_bytes_to_wav(pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
     """Wrap raw 16-bit PCM bytes into a WAV file suitable for Sarvam."""
@@ -63,11 +73,11 @@ class SarvamASR:
 
         files = {
             "file": ("chunk.wav", wav_bytes, "audio/wav"),
-            "language_code": (None, language),
+            "language_code": (None, LANG_MAP.get((language or "").lower(), "hi-IN")),
             "model": (None, "saaras:v3"),
             "mode": (None, "transcribe"),
             "with_timestamps": (None, "false"),
-            "with_diarization": (None, "true"),
+            "with_diarization": (None, "false"),
         }
 
         async with httpx.AsyncClient(timeout=30) as client:

@@ -47,6 +47,22 @@ QUESTION_TOKENS = re.compile(
     r"^(क्या|कितनी|कितना|कितने|बताइए|बताईए|बताए|बताएए|बताओ|कौन|कहाँ|कहां|है|हो|था|थी|थे)$"
 )
 
+# Tokens that must NOT appear inside a captured name phrase (question words,
+# pronouns, connectors). Kept here separately so the name Q&A rule can reuse it.
+BAD_NAME_TOKENS = re.compile(
+    r"^(क्या|कौन|कहाँ|कहां|कितनी|कितना|कितने|बताइए|बताईए|बताए|बताओ|बढ़े|बड़े|बोलिए|बोलो|"
+    r"है|हैं|हो|हूं|नहीं|"
+    r"आप|आपका|आपकी|आपके|तुम|तुम्हारा|तुम्हारी|तुम्हारे|मेरा|मेरी|मेरे|उसका|उसकी|उनका|उनकी|"
+    r"और|का|की|के|को|नाम|उम्र|पता|साल|ठीक|चलिए|आईए|अच्छा|हाँ|हां)$"
+)
+
+# Keywords that signal a NEW question/field right after the previous answer
+# (used to stop an answer-capture region from bleeding into the next Q&A).
+NEXT_QUESTION_RE = re.compile(
+    r"आपका|आपकी|आपके|तुम्हारा|तुम्हारी|उम्र|पता|कितनी|कितना|कितने|कहाँ|कहां|कौन|कब|"
+    r"गाँव|गांव|जिला|ब्लॉक|स्वास्थ्य|एएनसी|LMP"
+)
+
 
 def _to_int(text: str) -> Optional[float]:
     text = text.strip()
@@ -82,10 +98,106 @@ def _last(text: str, pattern: str) -> Optional[str]:
     return value
 
 
+def _answer_number(text: str, keyword: str, window: int = 24) -> Optional[float]:
+    """Extract the numeric ANSWER that follows a question keyword, skipping
+    intermediate question words. Handles the real Q&A pattern where the reply
+    comes AFTER the question, e.g. 'उम्र क्या है 35' -> 35."""
+    idx = text.find(keyword)
+    if idx == -1:
+        return None
+    region = text[idx + len(keyword): idx + len(keyword) + window]
+    tokens = [
+        w
+        for w in re.split(r"[\s,.?।!]+", region)
+        if w and not QUESTION_TOKENS.fullmatch(w)
+    ]
+    if not tokens:
+        return None
+    # Try longest prefix first: 'पैंतीस साल' fails as a whole, falls back to
+    # 'पैंतीस' = 35. '35 साल' -> '35' + then 35. 'क्या है 35' -> 35.
+    for n in range(len(tokens), 0, -1):
+        val = _to_int(" ".join(tokens[:n]))
+        if val:
+            return float(val) if isinstance(val, float) else val
+    return None
+
+
+def _answer_name(text: str, keyword: str = "नाम") -> Optional[str]:
+    """Grab the patient's NAME answer that appears AFTER a name question.
+
+    The strict regex can't cross a comma, so real Q&A speech like:
+      'आपका नाम बताइए, प्रीति कुमारी'  ->  'प्रीति कुमारी'
+    fails with the simple rule. This looks at the region following the
+    keyword, skips question words/punctuation, and takes the last plausible
+    1-3 word Devanagari phrase that isn't itself a question or a new field."""
+    idx = text.find(keyword)
+    if idx == -1:
+        return None
+    region = text[idx + len(keyword):]
+    nq = NEXT_QUESTION_RE.search(region)
+    if nq:
+        region = region[: nq.start()]
+    tokens = [w for w in re.split(r"[\s,.?।!-]+", region) if w]
+    if not tokens:
+        return None
+    # Drop question/mangled words, accept only clean Devanagari word tokens.
+    clean = [
+        w for w in tokens
+        if not BAD_NAME_TOKENS.fullmatch(w)
+        and re.fullmatch(r"[\u0900-\u097F]+", w)
+        and len(w) >= 2
+    ]
+    if len(clean) >= 2:
+        return " ".join(clean[:2])   # first name+last name
+    if len(clean) == 1:
+        return clean[0]
+    return None
+
+
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
+def hindi_normalize(text: str) -> str:
+    """Normalize ASR text into the canonical forms the regex rules expect.
+
+    - Devanagari digits -> Latin digits (५ -> 5)
+    - Common ASR-collisions of Hindi speech -> normalized spelling
+    - Collapse whitespace / stray punctuation
+    """
+    text = text.strip()
+    text = "".join(str(HINDI_DIGITS.get(c, c)) for c in text)
+    text = text.replace("गाँव", "गांव")
+    text = re.sub(r"[,;]+", ",", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def devanagari_ratio(text: str) -> float:
+    """Fraction of alphabetic characters that are Devanagari (0..1).
+
+    Whisper/Sarvam sometimes emit Latin-script 'Hinglish' renders of Hindi
+    speech (e.g. 'Nam seeta devi hai'). Our regex rules only match Devanagari,
+    so such chunks are unusable for field extraction."""
+    letters = [c for c in text if (c.isalpha() or c == "़")]
+    if not letters:
+        return 1.0
+    dev = len([c for c in letters if DEVANAGARI_RE.match(c)])
+    return dev / len(letters)
+
+
+# If the transcript is mostly Latin script (Hinglish), regex fill can't match.
+# Don't fill anything from it rather than store partially-wrong values.
+MIN_DEVANAGARI_RATIO = 0.35
+
+
 def local_fill(transcript: str) -> dict:
     """Return lightweight {field_key: value} from the transcript."""
-    text = transcript or ""
-    text = text.replace("गाँव", "गांव")
+    text = hindi_normalize(transcript or "")
+    if not text:
+        return {}
+    # Script-fidelity gate: mostly-Latin transcripts poison every regex below.
+    if devanagari_ratio(text) < MIN_DEVANAGARI_RATIO:
+        return {}
     result: dict[str, Any] = {}
 
     # --- phone: 10-digit sequence ----------------------------------------
@@ -111,6 +223,10 @@ def local_fill(transcript: str) -> dict:
         if re.search(r"(पति|पती|पिता|का\s*\w*$)", ctx):
             continue  # someone else's name
         name = value
+    if not name:
+        # Real Q&A speech: 'आपका नाम बताइए, प्रीति कुमारी' — strict regex can't
+        # cross a comma, so fall back to capturing the answer after the question.
+        name = _answer_name(text, "नाम")
     if name:
         result["name"] = name
 
@@ -124,12 +240,18 @@ def local_fill(transcript: str) -> dict:
         result["spouse_parent_of"] = value
 
     # --- age --------------------------------------------------------------
-    m = re.search(r"उम्र\s*[:]?\s*([\u0900-\u097F\d\s]+?)\s*साल", text) or \
-        re.search(r"उम्र\s*[:]?\s*([\d\u0900-\u097F]+)", text)
-    if m and m.group(1):
-        val = _to_int(m.group(1))
-        if val:
-            result["age"] = int(val)
+    # Handles both styles:
+    #  - 'उम्र 35' / 'उम्र पैंतीस साल' (value right after keyword)
+    #  - 'उम्र क्या है 35' / 'आपकी उम्र क्या है? 35' (answer AFTER the question)
+    age = _answer_number(text, "उम्र", window=24)
+    if not age:
+        m = re.search(r"उम्र\s*[:]?\s*([\u0900-\u097F\d\s]+?)\s*साल", text)
+        if m and m.group(1):
+            val = _to_int(m.group(1))
+            if val:
+                age = val
+    if age:
+        result["age"] = int(age)
 
     # --- block / district / village ----------------------------------------
     value = _last(

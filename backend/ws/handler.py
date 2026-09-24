@@ -65,6 +65,60 @@ class ChunkSession:
             return [self.indic, self.groq, self.sarvam, self.bhashini, self.local_asr]
         return [self.groq, self.sarvam, self.bhashini, self.indic, self.local_asr]
 
+    def _prompt_context(self, language: str) -> str:
+        """Build Whisper prompt = tail of previous transcript + domain vocab last.
+
+        Capped to stay safely under Groq's 896-character prompt limit so a
+        long session can never 400 with an oversized prompt mid-recording.
+        """
+        tail = ""
+        if self.transcript_buffer:
+            joined = " ".join(self.transcript_buffer[-2:])
+            tail = joined[-settings.prompt_tail_characters:]
+        terms = getattr(settings, "hi_prompt_terms", "").strip()
+        if "hi" in (language or "").lower() and terms:
+            parts = [t for t in (tail, terms) if t]
+            prompt = " ".join(parts)
+        else:
+            prompt = tail
+        return prompt[: settings.prompt_max_characters]
+
+    @staticmethod
+    def _dedupe_boundary(previous: str, new: str) -> str:
+        """Strip a word re-emitted at the head of the new chunk (Whisper overlap)."""
+        if not previous or not new:
+            return new
+        prev_words = previous.split()
+        new_words = new.split()
+        if not prev_words or not new_words:
+            return new
+        strip = 0
+        if new_words[0] == prev_words[-1]:
+            strip = 1
+        elif len(prev_words) > 1 and new_words[0] == prev_words[-2]:
+            strip = 1
+        return " ".join(new_words[strip:]) if strip else new
+
+    def _gate_result(self, asr_result: dict, pcm_level: float) -> Optional[str]:
+        """Return None if chunk is usable; else 'rejected' (silence) or 'dropped'
+        (hallucination/low-confidence). Confidence metrics only exist for some
+        providers (local faster-whisper); the RMS gate works for all (incl.
+        Groq, which does not expose no_speech_prob)."""
+        no_speech = asr_result.get("no_speech_prob")
+        compression = asr_result.get("compression_ratio")
+        avg_logprob = asr_result.get("avg_logprob")
+
+        # Silence detected either by the provider metric or by PCM energy.
+        if no_speech is not None and no_speech > settings.no_speech_prob_threshold:
+            return "rejected"
+        if pcm_level < settings.min_pcm_level_for_speech:
+            return "rejected"
+        if compression is not None and compression > settings.compression_ratio_threshold:
+            return "dropped"
+        if avg_logprob is not None and avg_logprob < settings.avg_logprob_floor:
+            return "dropped"
+        return None
+
     async def process_chunk(self, payload: dict) -> Optional[dict]:
         if not self.active:
             return None
@@ -74,14 +128,50 @@ class ChunkSession:
         duration_ms = payload.get("duration_ms") or 0
         language = payload.get("language", "hi")
         self.chunk_ids.append(chunk_id)
+        context = self._prompt_context(language)
+
+        pcm_level = _pcm_level(pcm_b64)
+        logger.info(
+            "Chunk %d: len=%s dur=%sms js_rms=%.4f raw_rms=%.4f anlz_rms=%.4f anySignal=%s ctxRate=%s dev=%r@%s level=%.4f",
+            chunk_id,
+            len(pcm_b64),
+            duration_ms,
+            float(payload.get("rms") or 0),
+            float(payload.get("raw_rms") or 0),
+            float(payload.get("analyser_rms") or 0),
+            payload.get("anySignal"),
+            payload.get("actualRate"),
+            payload.get("label") or "?",
+            payload.get("devRate") or "?",
+            pcm_level,
+        )
+
+        empty_payload = {
+            "type": "chunk_result",
+            "chunk_id": chunk_id,
+            "encounter_id": self.encounter_id,
+            "transcript": "",
+            "status": "rejected",
+            "speaker": "unknown",
+            "language": "",
+            "answers": self.merge.get_snapshot()["answers"],
+            "confirmed": self.merge.get_snapshot()["_confirmed"],
+            "alerts": [],
+        }
+
+        # Cheap pre-ASR silence gate: don't burn a cloud call on quiet/noise.
+        pcm_level = _pcm_level(pcm_b64)
+        if not pcm_b64 or pcm_level < settings.min_pcm_level_for_speech:
+            return empty_payload
 
         transcript = ""
         asr_result: dict = {"speaker": "unknown", "language": ""}
+        provider_name = ""
 
         for provider in self._provider_order(language):
             try:
                 result = await provider.transcribe_chunk(
-                    pcm_b64, language=language, duration_ms=duration_ms
+                    pcm_b64, language=language, duration_ms=duration_ms, context=context
                 )
             except TypeError:
                 result = await provider.transcribe_chunk(pcm_b64, language=language)
@@ -97,20 +187,51 @@ class ChunkSession:
             if result and result.get("text"):
                 transcript = result["text"]
                 asr_result = result
+                provider_name = type(provider).__name__
+                logger.info(
+                    "Chunk %d ASR ok via %s (dur=%dms): %r",
+                    chunk_id,
+                    provider_name,
+                    duration_ms,
+                    transcript[:100],
+                )
                 break
 
         if not transcript:
-            return {
-                "type": "chunk_result",
-                "chunk_id": chunk_id,
-                "encounter_id": self.encounter_id,
-                "transcript": "",
-                "speaker": "unknown",
-                "language": "",
-                "answers": self.merge.get_snapshot()["answers"],
-                "confirmed": self.merge.get_snapshot()["_confirmed"],
-                "alerts": [],
-            }
+            return empty_payload
+
+        # Post-ASR gating: silence / hallucination should never reach the sheet.
+        gate = self._gate_result(asr_result, pcm_level)
+        if gate == "rejected":
+            logger.info(
+                "Chunk %d rejected as silence (dur=%dms pcm_level=%.4f prov=%s text=%r)",
+                chunk_id,
+                duration_ms,
+                pcm_level,
+                provider_name,
+                transcript[:60],
+            )
+            return empty_payload
+        if gate == "dropped":
+            logger.info(
+                "Chunk %d dropped (low confidence, %s avg_logprob=%.2f): %r",
+                chunk_id,
+                provider_name,
+                asr_result.get("avg_logprob", float("nan")),
+                transcript[-80:],
+            )
+            return empty_payload
+
+        # Overlap dedup across chunk seams (Whisper re-emits tail words).
+        previous = " ".join(self.transcript_buffer[-1:]) if self.transcript_buffer else ""
+        transcript = self._dedupe_boundary(previous, transcript)
+        if not transcript:
+            return empty_payload
+
+        tentative = bool(
+            asr_result.get("avg_logprob") is not None
+            and asr_result.get("avg_logprob") < settings.avg_logprob_tentative
+        )
 
         self.transcript_buffer.append(transcript)
         full_transcript = " ".join(self.transcript_buffer)
@@ -126,6 +247,9 @@ class ChunkSession:
             "chunk_id": chunk_id,
             "encounter_id": self.encounter_id,
             "transcript": transcript,
+            "status": "tentative" if tentative else "finalized",
+            "confidence": asr_result.get("avg_logprob"),
+            "provider": provider_name,
             "speaker": asr_result.get("speaker", "unknown"),
             "language": asr_result.get("language", ""),
             "answers": snapshot["answers"],

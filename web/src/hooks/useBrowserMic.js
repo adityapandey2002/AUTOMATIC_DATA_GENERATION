@@ -1,10 +1,10 @@
 import { useCallback, useRef, useState } from "react";
 
 const SAMPLE_RATE = 16000;
-const CHUNK_TARGET_MS = 2000;
-const MIN_CHUNK_MS = 300;
-const VAD_THRESHOLD = 0.012;
-const IDLE_FLUSH_S = 0.6;
+const CHUNK_TARGET_MS = 6000;
+const MIN_CHUNK_MS = 800;
+const VAD_THRESHOLD = 0.002;
+const IDLE_FLUSH_S = 0.9;
 
 const CHUNKS_URL = `ws://${window.location.hostname}:8765/ws/chunks`;
 
@@ -70,6 +70,12 @@ export function useBrowserMic({ language = "hi", onLevel }) {
   const reconnectTimerRef = useRef(null);
   const onLevelRef = useRef(onLevel);
   onLevelRef.current = onLevel;
+  const rmsRef = useRef(0);
+  const rawRef = useRef({ anySignal: false });
+  const rawRmsRef = useRef(0);
+  const analyserRef = useRef(null);
+  const analyserReadRef = useRef(() => 0);
+  const micInfoRef = useRef({ label: "?", deviceId: "?", sampleRate: 0, channelCount: 0 });
   const encounterIdRef = useRef("");
 
   const sendPayload = (merged, rate) => {
@@ -78,12 +84,22 @@ export function useBrowserMic({ language = "hi", onLevel }) {
     const payload = {
       chunk_id: chunkIdRef.current++,
       pcm_b64,
-      sample_rate: rate,
+      // Wire data is ALWAYS 16k mono int16 (resampleToRate normalizes the
+      // context rate down to SAMPLE_RATE) - stamp that, not the ctx rate.
+      sample_rate: SAMPLE_RATE,
       channels: 1,
       mic_channel: 0,
       start_sample: sampleOffsetRef.current,
       end_sample: sampleOffsetRef.current + merged.length,
       duration_ms: Math.round((merged.length / SAMPLE_RATE) * 1000),
+      rms: rmsRef.current,
+      raw_rms: rawRmsRef.current,
+      analyser_rms: analyserReadRef.current(),
+      anySignal: rawRef.current.anySignal,
+      actualRate: rate,
+      label: micInfoRef.current.label,
+      deviceId: micInfoRef.current.deviceId,
+      devRate: micInfoRef.current.sampleRate,
       language,
     };
     sampleOffsetRef.current += merged.length;
@@ -211,13 +227,17 @@ export function useBrowserMic({ language = "hi", onLevel }) {
       // Create + resume the AudioContext synchronously inside the user gesture
       // (Chrome suspends contexts created in async callbacks, which silently
       // stops onaudioprocess and produces no audio — the "0 chunks" bug).
+      //
+      // Do NOT force {sampleRate: 16000} on the context. The mic's
+      // MediaStreamSource runs at the DEVICE rate (44.1/48 kHz); a 16k context
+      // makes Chrome/Edge resample that stream internally, and in current builds
+      // that resampler feeds ALL-ZERO buffers to ScriptProcessorNode — getUserMedia
+      // resolves, callbacks fire, but every sample is 0 (exactly the
+      // "js_rms=0.0000 anySignal=False" signature). Create the context at the
+      // default device rate and let resampleToRate() below downconvert to 16k
+      // for the wire (this path is proven correct).
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      let ctx;
-      try {
-        ctx = new AudioCtx({ sampleRate: SAMPLE_RATE });
-      } catch {
-        ctx = new AudioCtx();
-      }
+      const ctx = new AudioCtx();
       if (ctx.state === "suspended") {
         try {
           await ctx.resume();
@@ -233,10 +253,9 @@ export function useBrowserMic({ language = "hi", onLevel }) {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: SAMPLE_RATE,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
           },
         });
       } catch (err) {
@@ -250,27 +269,68 @@ export function useBrowserMic({ language = "hi", onLevel }) {
         return;
       }
       streamRef.current = stream;
+      const track = stream.getAudioTracks()[0];
+      let settings = {};
+      try {
+        settings = track?.getSettings?.() ?? {};
+      } catch {
+        /* ignore */
+      }
+      micInfoRef.current = {
+        label: track?.label || "?",
+        deviceId: settings.deviceId || "?",
+        sampleRate: settings.sampleRate || 0,
+        channelCount: settings.channelCount || 0,
+      };
 
       const source = ctx.createMediaStreamSource(stream);
       sourceRef.current = source;
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
+      // AnalyserNode taps the MediaStreamSource DIRECTLY — ground truth that
+      // bypasses ScriptProcessor entirely. If this shows signal but
+      // onaudioprocess input shows zeros, the ScriptProcessor input is the
+      // problem (switch to AudioWorklet). If this ALSO shows zeros, the OS/browser
+      // mic input is genuinely silent (wrong device / OS privacy / no mic).
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
       const mute = ctx.createGain();
       mute.gain.value = 0;
       source.connect(processor);
+      source.connect(analyser);
       processor.connect(mute);
       mute.connect(ctx.destination);
 
+      const readAnalyserRms = () => {
+        try {
+          const data = new Float32Array(analyser.fftSize);
+          analyser.getFloatTimeDomainData(data);
+          let s = 0;
+          for (let i = 0; i < data.length; i++) s += data[i] * data[i];
+          return Math.sqrt(s / data.length);
+        } catch {
+          return 0;
+        }
+      };
+      analyserReadRef.current = readAnalyserRms;
+
       processor.onaudioprocess = (e) => {
         let input = e.inputBuffer.getChannelData(0);
+        let rawSum = 0;
+        for (let i = 0; i < input.length; i++) rawSum += input[i] * input[i];
+        const rawRms = Math.sqrt(rawSum / input.length);
         if (actualRate !== SAMPLE_RATE) {
           input = resampleToRate(input, actualRate, SAMPLE_RATE);
         }
         let sum = 0;
         for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
         const rms = Math.sqrt(sum / input.length);
+        rmsRef.current = rms;
+        rawRmsRef.current = rawRms;
         const isSpeech = rms > VAD_THRESHOLD;
         onLevelRef.current?.(isSpeech ? Math.min(1, rms * 6) : 0);
+        if (rms > 0.0005 && !rawRef.current.anySignal) rawRef.current.anySignal = true;
 
         const vad = vadRef.current;
         if (isSpeech) {
@@ -286,7 +346,7 @@ export function useBrowserMic({ language = "hi", onLevel }) {
 
         if (isSpeech && accumulatedMs >= CHUNK_TARGET_MS) {
           flush(actualRate);
-        } else if (vad.seen && vad.idle >= IDLE_FLUSH_S && accumulatedMs >= MIN_CHUNK_MS) {
+        } else if (vad.idle >= IDLE_FLUSH_S && accumulatedMs >= MIN_CHUNK_MS) {
           flush(actualRate);
         }
       };

@@ -67,6 +67,7 @@ class GroqWhisperASR:
         pcm_b64: str,
         language: str = "hi",
         duration_ms: int | None = None,
+        context: str = "",
     ) -> dict:
         if not self._configured:
             return {"text": "", "speaker": "unknown", "confidence": 0.0}
@@ -89,7 +90,18 @@ class GroqWhisperASR:
             "language": (None, whisper_lang),
             "response_format": (None, "verbose_json"),
             "temperature": (None, "0"),
+            "timestamp_granularities[]": (None, "word"),
         }
+        if context and context.strip():
+            # Groq's prompt is token-limited (~224 tokens) even though the HTTP
+            # char cap is 896. A long transcript tail eats the budget and the
+            # domain terms get truncated off, silently degrading Hindi output.
+            # Keep the tail short and ALWAYS end with the domain vocabulary
+            # (handler appends hi_prompt_terms last), so the bias words survive
+            # the token window intact.
+            words = context.strip().split()
+            tail = " ".join(words[-140:])  # ~140 words ≈ 160-210 tokens
+            files["prompt"] = (None, tail[:650])
 
         async with httpx.AsyncClient(timeout=45) as client:
             try:
@@ -109,19 +121,40 @@ class GroqWhisperASR:
     def _parse_response(self, result: dict) -> dict:
         text = result.get("text", "") or ""
         segments = result.get("segments", []) or []
-        avg_confidence = 0.0
-        confidences = [
-            float(s.get("avg_logprob", 0.0))
-            for s in segments
-            if isinstance(s, dict) and s.get("avg_logprob") is not None
-        ]
-        if confidences:
-            avg_confidence = sum(confidences) / len(confidences)
+        avg_logprob = 0.0
+        no_speech_prob = 0.0
+        compression_ratio = 0.0
+        logprobs = []
+        no_speech_probs = []
+        compression_ratios = []
+        for s in segments:
+            if not isinstance(s, dict):
+                continue
+            if s.get("avg_logprob") is not None:
+                logprobs.append(float(s["avg_logprob"]))
+            if s.get("no_speech_prob") is not None:
+                no_speech_probs.append(float(s["no_speech_prob"]))
+            if s.get("compression_ratio") is not None:
+                compression_ratios.append(float(s["compression_ratio"]))
+        if logprobs:
+            avg_logprob = sum(logprobs) / len(logprobs)
+        if no_speech_probs:
+            no_speech_prob = sum(no_speech_probs) / len(no_speech_probs)
+        if compression_ratios:
+            compression_ratio = max(compression_ratios)
+        # Groq verbose_json returns words at top level (not inside segments).
+        words = result.get("words", []) or []
+        if not words and len(segments) == 1 and isinstance(segments[0], dict):
+            words = segments[0].get("words", []) or []
 
         return {
             "text": text,
             "speaker": "unknown",
-            "confidence": avg_confidence,
+            "confidence": avg_logprob,
+            "avg_logprob": avg_logprob,
+            "no_speech_prob": no_speech_prob,
+            "compression_ratio": compression_ratio,
+            "words": words,
             "language": result.get("language", ""),
-            "utterances": segments,
+            "utterances": segments or result.get("words", []) or [],
         }

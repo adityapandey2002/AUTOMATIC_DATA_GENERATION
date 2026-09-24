@@ -59,6 +59,7 @@ class LocalWhisperASR:
         pcm_b64: str,
         language: str = "hi",
         duration_ms: int | None = None,
+        context: str = "",
     ) -> dict:
         if not self._configured:
             return {"text": "", "speaker": "unknown", "confidence": 0.0}
@@ -86,13 +87,18 @@ class LocalWhisperASR:
         def _run():
             with self._lock:
                 model = self._load_model()
-                segments, info = model.transcribe(
-                    wav_buf,
+                kwargs = dict(
                     language=whisper_lang,
                     beam_size=1,
                     vad_filter=True,
                     condition_on_previous_text=True,
+                    no_speech_threshold=settings.no_speech_prob_threshold,
+                    log_prob_threshold=settings.avg_logprob_floor,
+                    compression_ratio_threshold=settings.compression_ratio_threshold,
                 )
+                if context and context.strip():
+                    kwargs["initial_prompt"] = context.strip()
+                segments, info = model.transcribe(wav_buf, **kwargs)
                 text = " ".join(seg.text.strip() for seg in segments).strip()
                 return text, info
 
@@ -105,6 +111,7 @@ class LocalWhisperASR:
                 "text": text,
                 "speaker": "unknown",
                 "confidence": getattr(info, "avg_logprob", 0.0),
+                "avg_logprob": getattr(info, "avg_logprob", 0.0),
                 "language": (getattr(info, "language", "") or ""),
             }
         except Exception as e:

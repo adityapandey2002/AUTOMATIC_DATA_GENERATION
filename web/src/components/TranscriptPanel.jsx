@@ -128,8 +128,9 @@ export default function TranscriptPanel({
                   </span>
                 )}
               </div>
-              <p className="text-sm text-slate-700 leading-relaxed bg-white rounded-xl rounded-tl-sm ring-1 ring-slate-100 shadow-sm px-3.5 py-2.5">
+              <p className={`text-sm text-slate-700 leading-relaxed bg-white rounded-xl rounded-tl-sm ring-1 ring-slate-100 shadow-sm px-3.5 py-2.5 ${msg.tentative ? "italic text-slate-400 ring-dashed ring-slate-200" : ""}`}>
                 {msg.text}
+                {msg.tentative && <span className="ml-1 text-slate-300">…</span>}
               </p>
             </div>
           );

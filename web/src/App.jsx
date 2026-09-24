@@ -113,13 +113,14 @@ export default function App() {
     }
 
     if (lastMessage.type === "chunk_result") {
-      if (lastMessage.transcript) {
+      if (lastMessage.transcript && lastMessage.status !== "rejected" && lastMessage.status !== "empty") {
         setMessages((prev) => [
           ...prev,
           {
             text: lastMessage.transcript,
             speaker: lastMessage.speaker,
             language: lastMessage.language,
+            tentative: lastMessage.status === "tentative",
           },
         ]);
       }
