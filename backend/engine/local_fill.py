@@ -238,6 +238,7 @@ def local_fill(transcript: str) -> dict:
     )
     if value:
         result["spouse_parent_of"] = value
+        result["husband_name"] = value  # cover page + partograph + hospital copy
 
     # --- age --------------------------------------------------------------
     # Handles both styles:
@@ -334,25 +335,34 @@ def local_fill(transcript: str) -> dict:
             ctx = tail[max(0, m.start() - 8):m.start()]
             events.append((m.start(), "N" if "नहीं" in ctx else "Y"))
         if not events:
+            # Positive assertion without हाँ/नहीं: "जटिलता है", "प्रसव पीड़ा शुरू है".
+            # Skip the question itself ("क्या जटिलता है?") — only trust the answer.
+            region = tail
+            q = region.find("?")
+            if q != -1:
+                region = region[q + 1:]
+            if "नहीं" in region[:40]:
+                return "No"
+            m = re.search(r"(?:है|शुरू)", region[:60])
+            if m:
+                lookback = region[max(0, m.start() - 24): m.start()]
+                if re.search(r"क्या|जरूरत|चाहिए", lookback):
+                    return None  # still the question, no answer yet
+                return "Yes"
             return None
         return "Yes" if events[-1][1] == "Y" else "No"
 
-    # ANC — "एएनसी/जांच ... हाँ/हो गई" -> anc_checkup_done (+ visit count)
-    for hint, key in (
-        ("एएनसी", "anc_checkup_done"),
-        ("एनसी", "anc_checkup_done"),
-        ("एन. सी", "anc_checkup_done"),
-        ("एन.सी", "anc_checkup_done"),
-    ):
-        val = yesno_after(hint)
-        if val:
-            result.setdefault(key, val)
-    for hint in ("एएनसी", "एनसी", "एन. सी", "एन.सी"):
+    # ANC visit count — "एएनसी ... 4 बार" -> anc_visits (प्रसव पूर्व जाँच की संख्या)
+    for hint in ("एएनसी", "एनसी", "एन. सी", "एन.सी", "प्रसव पूर्व जाँच"):
         idx = text.find(hint)
         if idx != -1:
             region = text[idx: idx + 120]
             m = None
-            for fm in re.finditer(r"(\d{1,2}\s*bार|\d{1,2}\s*visits|visits\s*\d{1,2}|([\u0900-\u097F]{2,10})\s*बार)", region, re.IGNORECASE):
+            for fm in re.finditer(
+                r"(\d{1,2})\s*(?:बार|bार|times|visits?)|([\u0900-\u097F]{2,10})\s*बार",
+                region,
+                re.IGNORECASE,
+            ):
                 m = fm
             if m:
                 grp = m.group(1) or m.group(2)
@@ -361,14 +371,23 @@ def local_fill(transcript: str) -> dict:
                     result["anc_visits"] = int(val)
                     break
 
-    # Complications only from explicit complication wording (not ANC).
-    for hint, key in (
-        ("जटिलता", "pregnancy_complication"),
-        ("परेशानी", "pregnancy_complication"),
-    ):
+    # Admission category (भर्ती की श्रेणी) — priority: complication > labour > referral.
+    # Only explicit complication wording counts (not ANC/जांच mentions).
+    complication = None
+    for hint in ("जटिलता", "परेशानी"):
         val = yesno_after(hint)
         if val:
-            result.setdefault(key, val)
+            complication = val
+    if complication == "Yes":
+        result["admission_category"] = "With pregnancy-related complication"
+    else:
+        labour = yesno_after("प्रसव पीड़ा")
+        if labour == "Yes":
+            result["admission_category"] = "With labour pain"
+        else:
+            referred = yesno_after("रेफर") or yesno_after("refer")
+            if referred == "Yes":
+                result["admission_category"] = "Referred from other centre"
 
     # --- baby / delivery keywords -------------------------------------------
     if re.search(r"सामान्य\s*प्रसव|सामान्य", text):
@@ -389,21 +408,21 @@ def local_fill(transcript: str) -> dict:
             result["birth_weight_kg"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
-    if re.search(r"प्री-टर्म|समय\s*से\s*पहले|preterm", text, re.IGNORECASE):
-        result.setdefault("preterm", "Yes")
     if re.search(r"जुड़वा|जुड़वाँ|जुड़वां|twin", text, re.IGNORECASE):
         result.setdefault("babies_count", "Twin")
 
-    # immunization
+    # immunization (BCG / OPV / Hep B) + separate Vitamin K1 checkbox
     shots = []
     for token, value in (
         ("बीसीजी", "BCG"), ("ओपीवी", "OPV"), ("हेपेटाइटिस", "Hepatitis B"),
-        ("विटामिन K1", "Inj. Vitamin K1"), ("ओपीवी", "OPV"), ("बी सी जी", "BCG"),
+        ("बी सी जी", "BCG"),
     ):
         if token in text:
             shots.append(value)
     if shots:
         result["immunization"] = shots
+    if re.search(r"विटामिन\s*K\s*1|विटामिन\s*के\s*वन|vitamin\s*k\s*1", text, re.IGNORECASE):
+        result["vitamin_k1"] = "Yes"
 
     # --- marital status ----------------------------------------------------
     if re.search(r"विवाहि|शादीशुदा|married", text, re.IGNORECASE):
@@ -411,11 +430,14 @@ def local_fill(transcript: str) -> dict:
     elif re.search(r"(अविवाहित|unmarried)", text, re.IGNORECASE):
         result["marital_status"] = "Unmarried"
 
-    # --- referral -----------------------------------------------------------
-    m = re.search(r"रेफर|refer", text, re.IGNORECASE)
-    if m:
-        idx = m.start()
-        snippet = _clean_capture(text[max(0, idx - 80): idx + 80])
-        result["referred_from"] = snippet or "Yes"
+    # --- discharge / final outcome -------------------------------------------
+    if re.search(r"मातृ\s*मृत्यु|मृत्यु हो", text):
+        result["final_outcome"] = "Death"
+    elif re.search(r"लामा|LAMA", text, re.IGNORECASE):
+        result["final_outcome"] = "LAMA"
+    elif "डिस्चार्ज" in text and re.search(r"रेफर|refer", text, re.IGNORECASE):
+        result["final_outcome"] = "Referral"
+    elif re.search(r"डिस्चार्ज\s*हो", text):
+        result["final_outcome"] = "Discharge"
 
     return {k: v for k, v in result.items() if v not in (None, "", [])}

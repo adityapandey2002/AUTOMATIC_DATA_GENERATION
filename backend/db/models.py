@@ -48,6 +48,14 @@ class Patient(Base):
     name = Column(String(200), nullable=True)
     age = Column(Integer, nullable=True)
     language = Column(String(50), nullable=True)
+    spouse_parent_of = Column(String(200), nullable=True)
+    contact_phone = Column(String(50), nullable=True)
+    address = Column(Text, nullable=True)
+    district = Column(String(100), nullable=True)
+    block = Column(String(100), nullable=True)
+    health_centre = Column(String(200), nullable=True)
+    answers = Column(JSON, nullable=True, default=dict)
+    saved_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     encounter = relationship("Encounter", back_populates="patient")
 

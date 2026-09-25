@@ -60,31 +60,23 @@ def validate_case_sheet(snapshot: dict) -> list[ValidationAlert]:
                 severity="warning",
             ))
 
-    if answers.get("pregnancy_complication") in ("Yes", "yes", "हाँ"):
+    category = str(answers.get("admission_category") or "")
+    if "complication" in category.lower() or "जटिलता" in category:
         alerts.append(ValidationAlert(
-            field="pregnancy_complication",
-            message="Patient presented with a pregnancy-related complication",
+            field="admission_category",
+            message="Patient admitted with a pregnancy-related complication",
             severity="warning",
         ))
-
-    if answers.get("preterm") in ("Yes", "yes", "हाँ"):
+    elif "referred" in category.lower() or "रेफर" in category:
         alerts.append(ValidationAlert(
-            field="preterm",
-            message="Preterm delivery flagged — monitor newborn closely",
-            severity="warning",
-        ))
-
-    if answers.get("referred_from"):
-        alerts.append(ValidationAlert(
-            field="referred_from",
-            message="Patient was referred from another centre — follow up on referral record",
+            field="admission_category",
+            message="Patient referred from another centre — follow up on referral record",
             severity="warning",
         ))
 
     text_fields = [
         ("provisional_diagnosis", answers.get("provisional_diagnosis")),
         ("final_diagnosis", answers.get("final_diagnosis")),
-        ("referred_from", answers.get("referred_from")),
     ]
     for key, value in text_fields:
         if not value:

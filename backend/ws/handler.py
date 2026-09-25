@@ -3,10 +3,10 @@
 - /ws/chunks    : capture agent streams PCM chunks; the backend runs
                   ASR -> Q&A form extraction -> merge -> broadcast.
 - /ws/dashboard : health-worker UI. Receives live transcript + form updates.
-                  Sends mic_start / mic_stop / confirm_field commands.
+                  Sends mic_start / mic_stop / set_field / save commands.
 
-The health worker has the final say: they start/stop recording and confirm
-each auto-filled field before it locks.
+Auto-filled fields land directly in the sheet (no per-field confirm).
+Manual cell edits (set_field) lock the value against ASR overwrite.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import math
+from datetime import datetime
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -296,14 +297,50 @@ class ChunkSession:
     def confirm(self, field_name: str) -> bool:
         return self.merge.confirm(field_name)
 
+    def set_field(self, field_name: str, value) -> bool:
+        return self.merge.set_field(field_name, value)
+
+    def _patient_from_answers(self, answers: dict, encounter_id: str) -> Patient:
+        def s(key):
+            v = answers.get(key)
+            if v is None:
+                return None
+            if isinstance(v, list):
+                return ", ".join(str(x) for x in v)
+            return str(v)
+
+        age_raw = answers.get("age")
+        age_val = None
+        if age_raw not in (None, ""):
+            try:
+                age_val = int(float(str(age_raw).strip()))
+            except (TypeError, ValueError):
+                age_val = None
+
+        return Patient(
+            encounter_id=encounter_id,
+            name=s("name"),
+            age=age_val,
+            language=None,
+            spouse_parent_of=s("spouse_parent_of"),
+            contact_phone=s("contact_phone"),
+            address=s("address"),
+            district=s("district"),
+            block=s("block"),
+            health_centre=s("health_centre"),
+            answers={k: v for k, v in answers.items() if v is not None},
+            saved_at=datetime.utcnow(),
+        )
+
     def _persist(self, db, snapshot: dict, alerts) -> None:
-        # Idempotent: a repeat finalize (same encounter_id) replaces old rows.
+        # Idempotent: a repeat finalize/save (same encounter_id) replaces old rows.
         if self.encounter_id:
             for model in (Utterance, VitalsSnapshot, Alert, Patient, Encounter):
                 db.execute(sa_delete(model).where(model.encounter_id == self.encounter_id) if hasattr(model, "encounter_id") else sa_delete(model).where(model.id == self.encounter_id))
         encounter = Encounter(id=self.encounter_id or None)
         db.add(encounter)
         db.flush()
+        self.encounter_id = encounter.id
 
         for i, text in enumerate(self.transcript_buffer):
             db.add(Utterance(
@@ -322,6 +359,10 @@ class ChunkSession:
             confirmed=False,
         ))
 
+        answers = snapshot["answers"]
+        patient = self._patient_from_answers(answers, encounter.id)
+        db.add(patient)
+
         for alert in alerts:
             db.add(Alert(
                 encounter_id=encounter.id,
@@ -331,7 +372,13 @@ class ChunkSession:
             ))
 
         db.commit()
-        logger.info("Persisted encounter %s with %d utterances", encounter.id, len(self.transcript_buffer))
+        logger.info(
+            "Persisted encounter %s (patient %s) with %d utterances",
+            encounter.id,
+            patient.id,
+            len(self.transcript_buffer),
+        )
+        return patient
 
 
 # --- Connection registries -------------------------------------------------
@@ -490,7 +537,47 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
                 else:
                     await broadcast_to_dashboard({"type": "session_state", "active": False})
 
+            elif msg_type == "set_field":
+                field = data.get("field", "")
+                value = data.get("value")
+                if current_session is None:
+                    current_session = ChunkSession()
+                if current_session.set_field(field, value):
+                    snapshot = current_session.merge.get_snapshot()
+                    await broadcast_to_dashboard({
+                        "type": "field_updated",
+                        "field": field,
+                        "value": value,
+                        "answers": snapshot["answers"],
+                    })
+
+            elif msg_type == "save":
+                session = current_session
+                if session is None:
+                    session = ChunkSession()
+                    current_session = session
+                if not session.encounter_id:
+                    import uuid as _uuid
+                    session.encounter_id = str(_uuid.uuid4())
+                snapshot = session.merge.get_snapshot()
+                validation_alerts = validate_case_sheet(snapshot)
+                db = SessionLocal()
+                try:
+                    patient = session._persist(db, snapshot, validation_alerts)
+                    patient_id = patient.id if patient else None
+                    encounter_id = session.encounter_id
+                finally:
+                    db.close()
+                await broadcast_to_dashboard({
+                    "type": "save_result",
+                    "ok": True,
+                    "encounter_id": encounter_id,
+                    "patient_id": patient_id,
+                    "answers": snapshot["answers"],
+                })
+
             elif msg_type == "confirm_field":
+                # Kept for wire compatibility; UI no longer sends this.
                 field = data.get("field", "")
                 if current_session and current_session.confirm(field):
                     await broadcast_to_dashboard({

@@ -28,10 +28,16 @@ async def test_rest():
 
 async def test_dashboard_ws():
     async with websockets.connect(WS_DASH, open_timeout=5) as ws:
-        # Dashboard must receive its own mic_start broadcast back
+        # Connect handler may push capture_status/snapshot first — drain until mic_start ack.
         await ws.send(json.dumps({"type": "mic_start", "encounter_id": "it-dash"}))
-        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        assert resp.get("type") == "session_state", f"got {resp.get('type')}"
+        resp = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=deadline - time.time()))
+            if msg.get("type") == "session_state":
+                resp = msg
+                break
+        assert resp is not None, "no session_state received after mic_start"
         assert resp.get("active") is True
         await ws.send(json.dumps({"type": "mic_stop"}))
         return f"WS {WS_DASH} mic_start/mic_stop round-trip OK"

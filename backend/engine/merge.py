@@ -69,6 +69,9 @@ class MergeEngine:
                 continue
             state = self.fields.states[key]
             if state.confirmed:
+                # Manual edits (set_field) lock the cell; a later auto-fill
+                # may still replace a value the health worker never touched,
+                # but never one they typed by hand.
                 continue
             # Latest statement wins (self-correction handled by Gemini ordering),
             # but a fresh mention always replaces the draft.
@@ -81,6 +84,16 @@ class MergeEngine:
             state.confirmed = True
             return True
         return False
+
+    def set_field(self, field_name: str, value: Any) -> bool:
+        """Manual edit from the UI: overwrite value and lock against ASR."""
+        if field_name not in FIELD_BY_KEY:
+            return False
+        state = self.fields.states[field_name]
+        state.value = value
+        state.confirmed = True
+        state.source_chunk_id = -1
+        return True
 
     def get_snapshot(self) -> dict:
         return self.fields.to_snapshot()

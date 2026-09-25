@@ -4,6 +4,7 @@ import { useBrowserMic } from "./hooks/useBrowserMic";
 import TranscriptPanel from "./components/TranscriptPanel";
 import CaseSheetForm from "./components/CaseSheetForm";
 import AlertBanner from "./components/AlertBanner";
+import PatientsList from "./components/PatientsList";
 import { FORM_SCHEMA } from "./formSchema";
 
 const WS_URL =
@@ -20,7 +21,6 @@ export default function App() {
   const [schema, setSchema] = useState(FORM_SCHEMA);
   const [messages, setMessages] = useState([]);
   const [answers, setAnswers] = useState({});
-  const [confirmed, setConfirmed] = useState({});
   const [alerts, setAlerts] = useState([]);
   const [recording, setRecording] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
@@ -28,6 +28,10 @@ export default function App() {
   const [voiceActive, setVoiceActive] = useState(false);
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [captureConnected, setCaptureConnected] = useState(false);
+  const [tab, setTab] = useState("scribe");
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+  const [lastSavedAt, setLastSavedAt] = useState(null);
   const timerRef = useRef(null);
   const voiceTimerRef = useRef(null);
   const encounterIdRef = useRef("");
@@ -96,15 +100,14 @@ export default function App() {
       if (lastMessage.active) {
         setMessages([]);
         setAnswers({});
-        setConfirmed({});
         setAlerts([]);
         setStartedAt(Date.now());
+        setSaveStatus("");
       }
     }
 
     if (lastMessage.type === "snapshot") {
       if (lastMessage.answers) setAnswers(lastMessage.answers);
-      if (lastMessage.confirmed) setConfirmed(lastMessage.confirmed);
       if (Array.isArray(lastMessage.transcript)) {
         setMessages((prev) => [...prev, ...lastMessage.transcript]);
       } else if (lastMessage.transcript) {
@@ -125,32 +128,54 @@ export default function App() {
         ]);
       }
       if (lastMessage.answers) setAnswers(lastMessage.answers);
-      if (lastMessage.confirmed) setConfirmed(lastMessage.confirmed);
       if (lastMessage.alerts?.length) setAlerts(lastMessage.alerts);
     }
 
-    if (lastMessage.type === "field_confirmed") {
-      setConfirmed((prev) => ({ ...prev, [lastMessage.field]: true }));
+    if (lastMessage.type === "field_updated") {
+      if (lastMessage.answers) setAnswers(lastMessage.answers);
     }
 
     if (lastMessage.type === "finalize_result") {
       setAnswers(lastMessage.answers || {});
-      setConfirmed(lastMessage.confirmed || {});
       setAlerts(lastMessage.alerts || []);
       setRecording(false);
       setStartedAt(null);
       setElapsed("");
       setVoiceActive(false);
     }
+
+    if (lastMessage.type === "save_result") {
+      setSaving(false);
+      if (lastMessage.ok) {
+        setLastSavedAt(Date.now());
+        setSaveStatus(`Saved ✓ ${lastMessage.encounter_id || ""}`);
+        setTab("patients");
+      } else {
+        setSaveStatus(lastMessage.error || "Save failed");
+      }
+    }
   }, [lastMessage]);
 
-  const handleConfirm = useCallback(
-    (field) => {
-      send({ type: "confirm_field", field });
-      setConfirmed((prev) => ({ ...prev, [field]: true }));
+  const handleEdit = useCallback(
+    (field, value) => {
+      setAnswers((prev) => ({ ...prev, [field]: value }));
+      send({ type: "set_field", field, value });
+      setSaveStatus("");
     },
     [send]
   );
+
+  const handleSave = useCallback(() => {
+    setSaving(true);
+    setSaveStatus("Saving…");
+    send({ type: "save" });
+    setTimeout(() => {
+      setSaving((s) => {
+        if (s) setSaveStatus("No response from backend");
+        return false;
+      });
+    }, 8000);
+  }, [send]);
 
   const handleMic = useCallback(() => {
     if (recording) {
@@ -164,10 +189,10 @@ export default function App() {
       encounterIdRef.current = encounterId;
       setMessages([]);
       setAnswers({});
-      setConfirmed({});
       setAlerts([]);
       setRecording(true);
       setStartedAt(Date.now());
+      setSaveStatus("");
       startMic(encounterId);
     }
   }, [recording, startMic, stopMic]);
@@ -197,6 +222,25 @@ export default function App() {
               </p>
             </div>
           </div>
+
+          <nav className="flex items-center gap-1 bg-black/15 rounded-full p-1">
+            <button
+              onClick={() => setTab("scribe")}
+              className={`px-4 py-1.5 rounded-full text-xs font-extrabold transition-all ${
+                tab === "scribe" ? "bg-white text-brand-800 shadow" : "text-white/80 hover:text-white"
+              }`}
+            >
+              Scribe
+            </button>
+            <button
+              onClick={() => setTab("patients")}
+              className={`px-4 py-1.5 rounded-full text-xs font-extrabold transition-all ${
+                tab === "patients" ? "bg-white text-brand-800 shadow" : "text-white/80 hover:text-white"
+              }`}
+            >
+              Patients
+            </button>
+          </nav>
 
           <div className="flex items-center gap-2.5">
             {recording && (
@@ -262,28 +306,38 @@ export default function App() {
       </div>
 
       {/* Main */}
-      <div className="flex-1 min-h-0 p-5 grid grid-cols-1 xl:grid-cols-[2fr_3fr] gap-5">
-        <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
-          <TranscriptPanel
-            messages={messages}
-            liveCount={filledCount}
-            voiceActive={voiceActive}
-            voiceLevel={voiceLevel}
-            captureConnected={captureConnected || recording}
-            recording={recording}
-            micError={micError}
-          />
+      {tab === "patients" ? (
+        <div className="flex-1 min-h-0 p-5">
+          <div className="h-full rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
+            <PatientsList refreshToken={lastSavedAt} />
+          </div>
         </div>
+      ) : (
+        <div className="flex-1 min-h-0 p-5 grid grid-cols-1 xl:grid-cols-[2fr_3fr] gap-5">
+          <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
+            <TranscriptPanel
+              messages={messages}
+              liveCount={filledCount}
+              voiceActive={voiceActive}
+              voiceLevel={voiceLevel}
+              captureConnected={captureConnected || recording}
+              recording={recording}
+              micError={micError}
+            />
+          </div>
 
-        <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
-          <CaseSheetForm
-            schema={schema}
-            answers={answers}
-            confirmed={confirmed}
-            onConfirm={handleConfirm}
-          />
+          <div className="min-h-0 rounded-2xl bg-white shadow-card ring-1 ring-slate-200/60 overflow-hidden flex flex-col">
+            <CaseSheetForm
+              schema={schema}
+              answers={answers}
+              onEdit={handleEdit}
+              onSave={handleSave}
+              saving={saving}
+              saveStatus={saveStatus}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

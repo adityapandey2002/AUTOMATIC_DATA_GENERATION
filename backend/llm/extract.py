@@ -297,6 +297,15 @@ class GeminiExtractor:
                     result[key] = [str(v) for v in value]
                 else:
                     result[key] = [str(value)]
+            elif spec["type"] == "table":
+                # Post-delivery vitals grid: {"row|column": value}
+                if isinstance(value, dict):
+                    result[key] = {
+                        str(k): str(v) for k, v in value.items()
+                        if v not in (None, "")
+                    } or None
+                else:
+                    result[key] = None
         return result
 
     @staticmethod

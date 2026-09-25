@@ -54,6 +54,41 @@ async def schema():
     return FORM_SCHEMA
 
 
+@app.get("/api/patients")
+async def list_patients():
+    from db.connection import SessionLocal
+    from db.models import Patient
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Patient)
+            .order_by(Patient.saved_at.desc())
+            .limit(200)
+            .all()
+        )
+        return [
+            {
+                "id": p.id,
+                "encounter_id": p.encounter_id,
+                "name": p.name,
+                "age": p.age,
+                "language": p.language,
+                "spouse_parent_of": p.spouse_parent_of,
+                "contact_phone": p.contact_phone,
+                "address": p.address,
+                "district": p.district,
+                "block": p.block,
+                "health_centre": p.health_centre,
+                "answers": p.answers or {},
+                "saved_at": p.saved_at.isoformat() if p.saved_at else None,
+            }
+            for p in rows
+        ]
+    finally:
+        db.close()
+
+
 @app.websocket("/ws/chunks")
 async def chunk_endpoint(websocket: WebSocket):
     await ws_chunks_handler(websocket)

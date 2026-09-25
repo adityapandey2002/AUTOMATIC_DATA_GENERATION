@@ -1,8 +1,50 @@
 # Run & Usage Guide — Windows
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-09-25
 
 How to run and verify the Ambient Clinical AI Scribe locally on Windows.
+
+## Quick start (3 terminals, in order)
+
+### 1. Backend (must be first) — port 8765
+```powershell
+cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\backend
+venv\Scripts\python.exe -m uvicorn main:app --port 8765 --host 127.0.0.1
+```
+Verify: `Invoke-WebRequest http://127.0.0.1:8765/health` → `{"status":"ok"}`
+
+### 2. Web dashboard — port 3000
+```powershell
+cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\web
+npm run dev
+```
+Open **http://localhost:3000** — note: binds IPv6 localhost, `127.0.0.1:3000` will NOT work.
+
+### 3. Capture agent (mic) — run from repo ROOT
+```powershell
+cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT
+backend\venv\Scripts\python.exe capture-agent\main.py --language hi --encounter-id demo
+```
+
+### Typical controls
+- **Start mic:** dashboard button (sends `mic_start`) or agent auto-starts
+- **Stop mic:** dashboard button (`mic_stop`)
+- **Confirm a field:** click checkmark in case sheet → field locks permanently
+- **End patient:** agent Ctrl+C or dashboard finalize → one Gemini call + persist
+
+### Stop everything (targeted)
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -match 'uvicorn' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -match 'vite' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+### Run tests (backend must be running, no mic needed)
+```powershell
+cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\backend
+venv\Scripts\python.exe integration_test.py
+```
 
 ## Prerequisites / Only working Python
 
