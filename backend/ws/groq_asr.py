@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
+# Groq validates the prompt against an 896-unit cap — empirically UTF-8 BYTES,
+# not characters (a 650-char Devanagari-heavy prompt rejected as "926 chars").
+# Stay well under it.
+_PROMPT_MAX_BYTES = 850
+
+
+def _prompt_utf8_limited(text: str, max_bytes: int = _PROMPT_MAX_BYTES) -> str:
+    """Truncate to max_bytes from the FRONT so trailing domain terms survive."""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    # Cut the oldest bytes; errors="ignore" drops a split leading char.
+    return raw[-max_bytes:].decode("utf-8", errors="ignore").lstrip()
+
 _PLACEHOLDER_KEYS = {"", "your_groq_api_key", "YOUR_GROQ_API_KEY"}
 
 # Internal lang tags -> Groq/Whisper ISO-639-1 codes. Whisper has no native
@@ -101,7 +115,7 @@ class GroqWhisperASR:
             # the token window intact.
             words = context.strip().split()
             tail = " ".join(words[-140:])  # ~140 words ≈ 160-210 tokens
-            files["prompt"] = (None, tail[:650])
+            files["prompt"] = (None, _prompt_utf8_limited(tail))
 
         async with httpx.AsyncClient(timeout=45) as client:
             try:

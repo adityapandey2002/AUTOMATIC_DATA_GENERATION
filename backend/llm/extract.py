@@ -182,7 +182,10 @@ class GeminiExtractor:
             # None => that model's PER-DAY pool is spent. A different model has
             # its own pool, so fail over immediately instead of retrying into a
             # quota that will not recover for hours.
-        logger.error("Gemini extraction unavailable: no model has quota today")
+        logger.error(
+            "Gemini extraction unavailable (quota exhausted or service error); "
+            "keeping local fill"
+        )
         return self._empty_result()
 
     async def _extract_with_model(
@@ -232,11 +235,14 @@ class GeminiExtractor:
                     _mark_daily_quota_blocked(model)
                     return None
 
-                if attempt == MAX_ATTEMPTS:
+                if attempt == MAX_ATTEMPTS or (code == 503 and attempt >= 2):
+                    # 503 = service-wide demand spike; a sibling model is just
+                    # as loaded, so don't burn the full retry ladder per model
+                    # and stall finalize() for a minute.
                     logger.error(
                         "Gemini extraction failed on %s after %d attempts: %s",
                         model,
-                        MAX_ATTEMPTS,
+                        attempt,
                         e,
                     )
                     return None  # next model has a different quota pool
