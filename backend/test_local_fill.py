@@ -59,6 +59,51 @@ def test_name_extraction() -> None:
     check("name: after question + comma", local_fill("आपका नाम बताइए, प्रीति कुमारी").get("name"), "प्रीति कुमारी")
 
 
+def test_name_does_not_absorb_field_answers() -> None:
+    """A live session saved the delivery-mode answer as part of the name.
+
+    The strict capture class is [Devanagari\\w\\s-]{2,40}?, which happily runs
+    across spaces to the end of the sentence, and the loop keeps the LAST
+    match. So a three-chunk encounter produced:
+
+        '... मेरा नाम शिवानी'                    -> 'शिवानी'   ok
+        '... मेरा नाम शिवानी सामान्य एलएमपी'   -> 'शिवानी सामान्य एलएमपी'
+        '... नाम शिवानी प्रसव नंबर क्या है?'    -> 'शिवानी प्रसव'
+
+    and since merge() is latest-wins, the WORST version is what got persisted
+    as the patient's name. A name never contains clinical vocabulary, so the
+    span is cut at the first domain term.
+    """
+    # Exactly the chunks from the reported session, cumulatively.
+    c1 = " चलो तुम बताओ तुमारा नाम क्या है? मेरा नाम शिवानी"
+    c2 = " सामान्य एलएमपी"
+    c3 = " चलो बताओ तुमारों नाम क्या है? शिवानी प्रसव नंबर क्या है?"
+    check("name: stable after 1 chunk", local_fill(c1).get("name"), "शिवानी")
+    check("name: stable after 2 chunks", local_fill(c1 + c2).get("name"), "शिवानी")
+    check("name: stable after 3 chunks", local_fill(c1 + c2 + c3).get("name"), "शिवानी")
+    # The delivery-mode answer is still extracted -- it must not be swallowed
+    # by the name fix, just kept out of the name.
+    check("name: sibling field still found", local_fill(c1 + c2).get("delivery_mode"), "Normal")
+
+
+def test_name_stop_words_are_word_bounded() -> None:
+    """The stop list must not eat names that merely start with a domain word.
+
+    A bare "प्री" (intended for "pre-term") matches inside प्रीति and silently
+    destroyed a real patient's name. Every term is matched with a trailing BD.
+    """
+    for spoken, expected in [
+        ("आपका नाम बताइए, प्रीति कुमारी", "प्रीति कुमारी"),
+        ("नाम प्रीता सिंह", "प्रीता सिंह"),
+        ("नाम प्रीतिमा देवी", "प्रीतिमा देवी"),
+        ("नाम सुनीता देवी", "सुनीता देवी"),
+        ("नाम क्या है राम कुमार", "राम कुमार"),
+        ("मेरा नाम मोहन लाल यादव", "मोहन लाल यादव"),
+        ("नाम सीता है", "सीता"),
+    ]:
+        check(f"name intact: {spoken!r}", local_fill(spoken).get("name"), expected)
+
+
 def test_phone_and_aadhaar() -> None:
     check("phone: 10-digit", local_fill("मेरा मोबाइल नंबर 9876543210 है").get("contact_phone"), "9876543210")
     check("aadhaar: 12-digit", local_fill("आधार कार्ड 1234 5678 9012 है").get("aadhaar_number"), "123456789012")

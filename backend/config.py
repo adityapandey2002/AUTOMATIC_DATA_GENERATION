@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     min_chunk_ms_for_whisper: int = 1000
     min_chunk_ms_for_cloud: int = 800
 
+    # Cloud ASR retry. A live encounter is a continuous stream of chunks, and a
+    # single dropped request silently loses that chunk's audio -- with every
+    # other provider inert (IndicConformer needs NeMo, Sarvam/Bhashini need
+    # keys, local whisper needs a ~500MB model download) Groq being the only
+    # working engine meant one blip stalled transcription for the whole session.
+    # Retries cover timeouts, connection resets, 429 and 5xx; 4xx is not
+    # retried because it means a config/credential problem, not a blip.
+    asr_max_attempts: int = 3
+    asr_timeout_s: float = 15.0
+    asr_retry_backoff_s: float = 0.6
+
     # Whisper confidence gating (providers that return metrics, e.g. local
     # faster-whisper). A chunk is REJECTED as silence when no_speech_prob
     # exceeds this; dropped below avg_logprob_floor.

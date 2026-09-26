@@ -3,15 +3,21 @@
 import asyncio
 import base64
 import json
+import os
 import sys
 import time
 
 import httpx
 import websockets
 
-BASE = "http://127.0.0.1:8765"
-WS_CHUNKS = "ws://127.0.0.1:8765/ws/chunks"
-WS_DASH = "ws://127.0.0.1:8765/ws/dashboard"
+# Point at an isolated instance to test without disturbing a live encounter:
+#   SCRIBE_TEST_PORT=8766, with the backend started using a separate
+#   DATABASE_URL (e.g. sqlite:///./test_scribe.db). Defaults to the
+#   developer's normal backend on 8765.
+_PORT = os.getenv("SCRIBE_TEST_PORT", "8765")
+BASE = f"http://127.0.0.1:{_PORT}"
+WS_CHUNKS = f"ws://127.0.0.1:{_PORT}/ws/chunks"
+WS_DASH = f"ws://127.0.0.1:{_PORT}/ws/dashboard"
 
 
 async def test_rest():

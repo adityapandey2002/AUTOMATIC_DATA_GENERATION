@@ -58,10 +58,35 @@ BAD_NAME_TOKENS = re.compile(
 
 # Keywords that signal a NEW question/field right after the previous answer
 # (used to stop an answer-capture region from bleeding into the next Q&A).
+#
+# The Devanagari spellings matter: Whisper transliterates the domain vocabulary
+# we inject as a prompt, so real transcripts say "एलएमपी" / "प्रसव पीड़ा", never
+# the Latin "LMP". A boundary list that only knows the Latin form never fires on
+# actual ASR output.
 NEXT_QUESTION_RE = re.compile(
     r"आपका|आपकी|आपके|तुम्हारा|तुम्हारी|उम्र|पता|कितनी|कितना|कितने|कहाँ|कहां|कौन|कब|"
-    r"गाँव|गांव|जिला|ब्लॉक|स्वास्थ्य|एएनसी|LMP"
+    r"गाँव|गांव|जिला|ब्लॉक|स्वास्थ्य|एएनसी|एनसी|एमसीटीएस|आरसीएच|एलएमपी|LMP|"
+    r"प्रसव|सामान्य|सीज़ेरियन|सीजेरियन|जुड़वा|गर्भपात|गर्भावस्था|प्री[- ]टर्म|"
+    r"शिशु|बीसीजी|बीसीजी|टीकाकरण|रेफर|डिस्चार्ज|पीड़ा|मासिक|धर्म|नंबर|पति|माता|पिता"
 )
+
+# A name is a person's name. Clinical/domain words are never part of one, and
+# letting them in produced garbage like "शिवानी सामान्य" that then got saved
+# as the patient's name. This is a hard stop for the name span specifically, so
+# a name can never absorb a field answer even if NEXT_QUESTION_RE changes.
+#
+# Terms are matched with a trailing BD, not bare. A bare "प्री" (intended for
+# "pre-term") also matches inside the name "प्रीति" and silently destroyed it,
+# which is exactly the class of bug this list exists to prevent.
+_NAME_STOP_TERMS = (
+    "प्रसव", "सामान्य", "सीज़ेरियन", "सीजेरियन", "जुड़वा", "गर्भपात",
+    "गर्भावस्था", "प्री टर्म", "प्री-टर्म", "शिशु", "बीसीजी", "बीसीजी",
+    "टीकाकरण", "रेफर", "डिस्चार्ज", "पीड़ा", "एलएमपी", "एमसीटीएस",
+    "आरसीएच", "एनसी", "एएनसी", "मासिक", "धर्म", "नंबर", "उम्र", "पता",
+    "साल", "गाँव", "गांव", "जिला", "ब्लॉक", "स्वास्थ्य", "चिकित्सा",
+    "पति", "पत्नी", "माता", "पिता", "पुत्र", "पुत्री", "बेटा", "बेटी", "रजा",
+)
+NAME_STOP_RE = re.compile("|".join(re.escape(t) for t in _NAME_STOP_TERMS) + BD)
 
 
 def _to_int(text: str) -> Optional[float]:
@@ -122,21 +147,39 @@ def _answer_number(text: str, keyword: str, window: int = 24) -> Optional[float]
     return None
 
 
+_NAME_WINDOW_CHARS = 40
+
+
 def _answer_name(text: str, keyword: str = "नाम") -> Optional[str]:
     """Grab the patient's NAME answer that appears AFTER a name question.
 
     The strict regex can't cross a comma, so real Q&A speech like:
       'आपका नाम बताइए, प्रीति कुमारी'  ->  'प्रीति कुमारी'
     fails with the simple rule. This looks at the region following the
-    keyword, skips question words/punctuation, and takes the last plausible
-    1-3 word Devanagari phrase that isn't itself a question or a new field."""
+    keyword, skips question words/punctuation, and takes the first plausible
+    1-2 word Devanagari phrase that isn't itself a question or a new field.
+
+    The span is bounded three ways, because an unbounded one produced names
+    like 'शिवानी सामान्य' -- the delivery-mode answer bleeding into the patient's
+    name, which then got persisted as their name:
+      * a character window (_NAME_WINDOW_CHARS),
+      * NEXT_QUESTION_RE, which signals the next question/field,
+      * NAME_STOP_RE, a hard stop on clinical vocabulary.
+    """
     idx = text.find(keyword)
     if idx == -1:
         return None
-    region = text[idx + len(keyword):]
+    # Bound the search window. A name follows its question immediately, so a
+    # short span is both sufficient and a second guard against a name running
+    # on into a later answer.
+    region = text[idx + len(keyword): idx + len(keyword) + _NAME_WINDOW_CHARS]
     nq = NEXT_QUESTION_RE.search(region)
     if nq:
         region = region[: nq.start()]
+    # Hard stop on domain vocabulary, independent of NEXT_QUESTION_RE.
+    stop = NAME_STOP_RE.search(region)
+    if stop:
+        region = region[: stop.start()]
     tokens = [w for w in re.split(r"[\s,.?।!-]+", region) if w]
     if not tokens:
         return None
@@ -217,7 +260,15 @@ def local_fill(transcript: str) -> dict:
         r"नाम\s*[:]?\s*([\u0900-\u097F\w\s-]{2,40}?)(?:\s*है" + BD + r"|\s*[.?।]|$)", text
     ):
         value = _clean_capture(m.group(1))
-        if QUESTION_TOKENS.fullmatch(value):
+        # The capture class allows spaces, so it runs to the end of the sentence
+        # and swept field answers into the name: "नाम शिवानी सामान्य एलएमपी"
+        # yielded "शिवानी सामान्य एलएमपी", which was then persisted as the
+        # patient's name. A name never contains clinical vocabulary, so cut the
+        # span at the first domain term.
+        stop = NAME_STOP_RE.search(value)
+        if stop:
+            value = _clean_capture(value[: stop.start()])
+        if not value or QUESTION_TOKENS.fullmatch(value):
             continue
         ctx = text[max(0, m.start() - 12):m.start()]
         if re.search(r"(पति|पती|पिता|का\s*\w*$)", ctx):

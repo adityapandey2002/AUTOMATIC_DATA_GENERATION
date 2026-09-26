@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 _PLACEHOLDER_KEYS = {"", "your_sarvam_api_key", "YOUR_SARVAM_API_KEY"}
 
+# Consecutive load/transcribe failures before the fallback switches itself off.
+# A missing or truncated model snapshot fails identically every single time, so
+# retrying it per chunk only adds latency to chunks the cloud provider could
+# have served.
+_MAX_LOAD_FAILURES = 3
+
 # Language codes passed to faster-whisper (map from our internal tags)
 LANG_MAP = {"hi": "hi", "mai": "hi", "mag": "hi", "bho": "hi", "hindi": "hi"}
 
@@ -31,6 +37,7 @@ class LocalWhisperASR:
         self.compute_type = compute_type or getattr(settings, "whisper_compute_type", "int8")
         self._model = None
         self._lock = threading.Lock()
+        self._consecutive_failures = 0
         self.enabled = getattr(settings, "use_local_fallback", True)
 
     @property
@@ -105,15 +112,52 @@ class LocalWhisperASR:
         try:
             import asyncio
             text, info = await asyncio.to_thread(_run)
+            self._consecutive_failures = 0
             if not text:
                 return {"text": "", "speaker": "unknown", "confidence": 0.0}
+            # Same rule as groq_asr._parse_response: a missing metric must be
+            # None, never 0.0. avg_logprob is a log-probability, so 0.0 is the
+            # *best possible* value -- a response with no metrics at all would
+            # sail past both the tentative and the floor gate as if Whisper were
+            # certain. None makes the gates skip.
+            avg_logprob = getattr(info, "avg_logprob", None)
+            if avg_logprob is not None:
+                avg_logprob = float(avg_logprob)
+            no_speech_prob = getattr(info, "no_speech_prob", None)
+            if no_speech_prob is not None:
+                no_speech_prob = float(no_speech_prob)
+            compression_ratio = getattr(info, "compression_ratio", None)
+            if compression_ratio is not None:
+                compression_ratio = float(compression_ratio)
             return {
                 "text": text,
                 "speaker": "unknown",
-                "confidence": getattr(info, "avg_logprob", 0.0),
-                "avg_logprob": getattr(info, "avg_logprob", 0.0),
+                "confidence": avg_logprob,
+                "avg_logprob": avg_logprob,
+                "no_speech_prob": no_speech_prob,
+                "compression_ratio": compression_ratio,
                 "language": (getattr(info, "language", "") or ""),
             }
         except Exception as e:
-            logger.error("LocalWhisper transcription failed: %s", e)
+            # Log the TYPE too: several exception classes stringify to an empty
+            # string, which is what produced the undiagnosable
+            # "LocalWhisper transcription failed:" line with nothing after it.
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= _MAX_LOAD_FAILURES and self._model is None:
+                # The weights almost certainly never downloaded. Retrying the
+                # load on every chunk would re-pay the multi-second hub timeout
+                # per chunk for the rest of the encounter, stalling the live
+                # pipeline while Groq was perfectly capable of serving it.
+                self.enabled = False
+                logger.error(
+                    "LocalWhisper disabled after %d failed attempts (%s: %s); "
+                    "cloud ASR is now the only path",
+                    self._consecutive_failures,
+                    type(e).__name__,
+                    e,
+                )
+            else:
+                logger.error(
+                    "LocalWhisper transcription failed: %s: %s", type(e).__name__, e
+                )
             return {"text": "", "speaker": "unknown", "confidence": 0.0}

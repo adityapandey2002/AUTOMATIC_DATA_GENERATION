@@ -10,6 +10,7 @@ no-bureaucracy cloud option.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -121,20 +122,52 @@ class GroqWhisperASR:
             tail = " ".join(words[-140:])  # ~140 words ≈ 160-210 tokens
             files["prompt"] = (None, _prompt_utf8_limited(tail))
 
-        async with httpx.AsyncClient(timeout=45) as client:
+        empty = {"text": "", "speaker": "unknown", "confidence": 0.0}
+        attempts = max(1, int(getattr(settings, "asr_max_attempts", 3)))
+        timeout = float(getattr(settings, "asr_timeout_s", 15.0))
+        backoff = float(getattr(settings, "asr_retry_backoff_s", 0.6))
+        last_error = "unknown"
+
+        for attempt in range(1, attempts + 1):
             try:
-                resp = await client.post(GROQ_URL, headers=headers, files=files)
-                if resp.status_code not in (200, 201):
-                    logger.error(
-                        "Groq transcription error: status=%s body=%s",
-                        resp.status_code,
-                        resp.text[:300],
-                    )
-                    return {"text": "", "speaker": "unknown", "confidence": 0.0}
-                return self._parse_response(resp.json())
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(GROQ_URL, headers=headers, files=files)
+                if resp.status_code in (200, 201):
+                    if attempt > 1:
+                        logger.info(
+                            "Groq: chunk recovered on attempt %d/%d", attempt, attempts
+                        )
+                    return self._parse_response(resp.json())
+
+                body = resp.text[:300]
+                # 429 and 5xx are transient; any other 4xx is a credential or
+                # request problem that will fail identically on every retry.
+                transient = resp.status_code == 429 or resp.status_code >= 500
+                last_error = f"HTTP {resp.status_code}: {body}"
+                if not transient:
+                    logger.error("Groq transcription error: %s", last_error)
+                    return empty
+                logger.warning(
+                    "Groq transcription attempt %d/%d failed (transient): %s",
+                    attempt, attempts, last_error,
+                )
             except Exception as e:
-                logger.error("Groq transcription failed: %s", e)
-                return {"text": "", "speaker": "unknown", "confidence": 0.0}
+                # Log the TYPE as well as the message: several httpx/asyncio
+                # exceptions stringify to an empty string, which produced the
+                # useless log line "Groq transcription failed:" with nothing
+                # after it and made this undiagnosable in the field.
+                last_error = f"{type(e).__name__}: {e}".strip()
+                logger.warning(
+                    "Groq transcription attempt %d/%d raised %s",
+                    attempt, attempts, last_error,
+                    exc_info=(attempt == attempts),
+                )
+
+            if attempt < attempts:
+                await asyncio.sleep(backoff * (2 ** (attempt - 1)))
+
+        logger.error("Groq transcription failed after %d attempts: %s", attempts, last_error)
+        return empty
 
     def _parse_response(self, result: dict) -> dict:
         text = result.get("text", "") or ""
