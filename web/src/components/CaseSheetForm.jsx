@@ -250,13 +250,13 @@ function FieldTile({ field, value, onEdit }) {
         wide ? "col-span-2 md:col-span-3" : ""
       } ${
         filled
-          ? "border-brand-200 bg-brand-50/50"
+          ? "border-blue-200 bg-blue-50/70"
           : "border-slate-200 bg-slate-50/60"
       } ${editing ? "ring-2 ring-brand-400 border-brand-400" : "hover:border-brand-300"}`}
     >
       <div className="flex items-center justify-between gap-1">
         <div className="min-w-0">
-          <span className={`block text-[10px] font-extrabold uppercase tracking-wider truncate ${filled ? "text-brand-700" : "text-slate-500"}`}>
+          <span className={`block text-[10px] font-extrabold uppercase tracking-wider truncate ${filled ? "text-blue-700" : "text-slate-500"}`}>
             {field.label_en}
           </span>
           <span className="block text-[10px] text-slate-400 truncate">{field.label_hi}</span>
@@ -269,7 +269,7 @@ function FieldTile({ field, value, onEdit }) {
         ) : (
           <span
             className={`block text-lg font-extrabold tracking-tight truncate ${
-              filled ? "text-slate-800" : "text-slate-300"
+              filled ? "text-blue-800" : "text-slate-300"
             }`}
             title={filled ? shown : undefined}
           >

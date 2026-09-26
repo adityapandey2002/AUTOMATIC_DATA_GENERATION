@@ -232,11 +232,11 @@ LANGUAGE ROUTING — handler._provider_order()
                                              │
                                              ▼
                                     ┌─ ⑤ LOCAL FILL (FREE) ────┐
-                                    │ local_fill(full)         │  ← Devanagari regex,
-                                    │  phone / name / age /    │    polarity Yes/No,
-                                    │  address / block /       │    last-match-wins,
-                                    │  district / LMP / ANC /  │    script-fidelity gate
-                                    │  delivery / baby / ...   │    (Devanagari ratio <0.35 → {})
+                                    │ local_fill(live window)  │  ← Devanagari regex,
+                                    │  last N chunks only      │    polarity Yes/No,
+                                    │  (phone / name / age /   │    last-match-wins,
+                                    │   address / LMP / ANC /  │    script-fidelity gate
+                                    │   delivery / baby / ...) │    (Devanagari <0.35 → {})
                                     └──────────────────────────┘
                                              │ {field: value}
                                              ▼
@@ -396,7 +396,7 @@ This meant naive rules matched **almost nothing** on real Hindi transcripts — 
 - **Last-match-wins:** answers usually come AFTER questions → use last match (`_last`, `_answer_number`, `_answer_name`)
 - **Script-fidelity gate:** Devanagari ratio < 0.35 → refuse to fill (`local_fill.py:190-200`)
 
-**Trade-off:** every new regex must remember `BD`, not `\b`; a future contributor adding `\b` reintroduces silent match failures (no unit tests catch this — existing tests are integration/live-API only).
+**Trade-off:** every new regex must remember `BD`, not `\b`; a future contributor adding `\b` reintroduces silent match failures. Now covered by `backend/test_local_fill.py`, whose `test_bd_boundary_not_word_boundary` asserts that `है\b` does *not* match `नाम सीता है` while `है`+`BD` does.
 
 ### Why finalize is idempotent
 
@@ -599,13 +599,15 @@ if encounter_id set:
 
 | # | Risk | Severity | Detail |
 |---|------|----------|--------|
-| 1 | **Single global session** | 🔴 High | `current_session` is one module-level global (`handler.py:341`). Two simultaneous encounters share/overwrite the same session. Only one encounter at a time. No session registry keyed by `encounter_id`. |
+| 1 | ~~**Single global session**~~ **RESOLVED** | ✅ Fixed | Was: `current_session` was one module-level global, so the capture agent and dashboard could hold *different* `ChunkSession` objects for one encounter, and a dashboard `mic_start` called `reset()` on the session the agent was streaming into — silently discarding the transcript. Now a `SessionRegistry` (`handler.py`) keys sessions by `encounter_id`, so both transports converge on the same object, and `mic_start` only resets a session that isn't already `active`. |
+| 1b | ~~**Whisper prompt echo fabricated clinical fields**~~ **RESOLVED** | ✅ Fixed | Was the most dangerous defect found: Whisper handed near-silence does not return nothing, it **regurgitates the prompt**. Because we always append `hi_prompt_terms` (a comma-separated domain vocabulary) as a decoding hint, a quiet chunk returned `" प्रसव पीड़ा, सामान्य प्रसव पीड़ा, रेफर, डिस्चार्ज"`, and `local_fill()` turned that into `{'delivery_mode': 'Normal', 'final_outcome': 'Referral'}` — a fabricated delivery mode *and* outcome on a maternity case sheet, for a patient who had said nothing. **Confidence gating provably cannot catch this**: measured against the live API the echo returns `avg_logprob=-0.149`, `no_speech_prob=0.113`, `compression_ratio=0.82`, i.e. Whisper is *confidently* wrong and clears every threshold. Fixed by `is_prompt_echo()` / `is_echo_fragment()` in `handler.py`, which compare the output against the prompt actually injected, plus verbatim-repeat and echo-fragment detection. The 3-word content threshold is deliberate: `प्रसव पीड़ा` (hallucination) and `सामान्य प्रसव` (a genuine patient answer = `delivery_mode: Normal`) are *both* two-word literal substrings of the vocabulary and are indistinguishable by content, so tightening to 2 words would suppress real clinical answers. The residual — a first, isolated two-word echo — is accepted: it extracts no fields and cannot repeat. Pinned by `test_prompt_echo_rejected`, `test_echo_threshold_tradeoff`, `test_echo_fragment_cascade` and `test_echo_live.py`. |
+| 1c | ~~**Missing ASR metrics read as perfect confidence**~~ **RESOLVED** | ✅ Fixed | Two compounding bugs made the whole confidence gate a no-op for Groq. (a) The request asked for `timestamp_granularities[]=word`, which returns a `words` array carrying *no* probability fields **and suppresses `segments` entirely** — so `avg_logprob` / `no_speech_prob` / `compression_ratio` were never available. (b) `_parse_response()` then defaulted those missing values to `0.0`, which is the *best possible* value for all three gates (`0.0 > 0.6` False, `0.0 < -1.5` False, `0.0 > 2.4` False), so a response with no segments was treated as maximally confident and bypassed every check. Fixed by requesting `segment` granularity and returning `None` for genuinely absent metrics, so absence is no longer encoded as certainty. Consequence worth noting: the `tentative` status could never fire for Groq before this fix. |
 | 2 | **No authentication** | 🔴 High | CORS `allow_origins=["*"]` + `allow_credentials=True` (`main.py:38-44`); both WS endpoints accept unauthenticated connections. PHI (Aadhaar, phone, name, diagnosis) exposed. |
 | 3 | **Gemini quota hot-spot** | 🟡 Medium | 20 req/day hard ceiling. Failover ladder masks across 4 models (~80/day) but all same free key. `_daily_quota_blocked` is in-process memory — restart forgets blocked models. |
 | 4 | **Chain degrades to 2 providers** | 🟡 Medium | IndicConformer (NeMo/Py3.14), Sarvam (key empty), Bhashini (key empty) all inert → effective chain = Groq → local whisper. Groq rate-limit → slow CPU fallback. |
 | 5 | **Persist not fully transactional** | 🟡 Medium | `_persist()` commits, then `log_deletion()` opens separate commit. Crash between → encounter persisted but no deletion-audit row. |
 | 6 | **Local fill coverage gap** | 🟡 Medium | ~20 of 40 fields have no regex rule (MCTS/RCH, IPD, admission category, EDD, diagnoses, contraceptive history, provider/outcome) — only fill if Gemini succeeds. |
-| 7 | **BD-lookahead fragility** | 🟠 Low-Med | Future contributor adding `\b` reintroduces silent failures. No unit tests assert local_fill outputs (only integration/live-API tests). |
+| 7 | **BD-lookahead fragility** | 🟠 Low-Med | Future contributor adding `\b` reintroduces silent failures. Now covered by `test_local_fill.py` (86 offline checks), which asserts `local_fill` outputs directly — including a `test_bd_boundary_not_word_boundary` case pinning the exact failure mode. |
 | 8 | **No diarization** | 🟠 Low-Med | `speaker="mixed"` persisted. Stereo channel exists "for future" but attribution not implemented — GNM vs patient disambiguated only by regex heuristics. |
 | 9 | **Audio retention** | 🟢 Low | `AUDIO_DELETE_AFTER_TRANSCRIBE=true` writes audit row only; chunks never stored server-side (transient in WS payload) — mostly no-op audit entry. |
 | 10 | **Schema mirror drift** | 🟢 Low | `web/src/formSchema.js` manually synced with `backend/form_schema.py` (mitigated by `/api/schema` fetch at boot). |
@@ -700,8 +702,14 @@ BHASHINI_API_KEY=          # empty
 | `web/src/components/AlertBanner.jsx` | Validation alerts |
 | `web/src/hooks/useBrowserMic.js` | Browser mic → RMS-VAD → WS |
 | `web/vite.config.js` | Dev proxy /api + /ws → 127.0.0.1:8765 |
+| `capture-agent/probe.py` | Mic device enumeration |
+| `backend/fhir/mapper.py` | Answers → FHIR-shaped mapping |
+| `web/src/components/VitalsForm.jsx` | Vitals entry form |
+| `web/src/components/PatientsList.jsx` | Saved-patient list view |
+| `backend/test_local_fill.py` | Unit tests: local_fill, merge, live window, provider introspection, session registry |
 | `docs/CODEMAPS/*.md` | Per-area codemaps (INDEX, backend, database, capture-agent, frontend) |
-| `docs/GUIDES/local-run.md` | Full Windows run guide |
+| `docs/GUIDES/local-run.md` | Shared Windows run guide |
+| `docs/GUIDES/local-run.LOCAL.md` | Per-machine run guide (gitignored, not pushed) |
 
 ---
 

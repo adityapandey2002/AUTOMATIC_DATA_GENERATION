@@ -13,6 +13,18 @@ from typing import Any
 from form_schema import FIELD_BY_KEY
 
 
+def is_empty(value: Any) -> bool:
+    """Single definition — previously duplicated as a staticmethod on both
+    CaseSheetFields and MergeEngine, which could drift apart."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (list, tuple, dict)):
+        return len(value) == 0
+    return False
+
+
 @dataclass
 class FieldState:
     value: Any = None
@@ -30,7 +42,7 @@ class CaseSheetFields:
         answers = {}
         confirmed = {}
         for key, st in self.states.items():
-            if not self._empty(st.value):
+            if not is_empty(st.value):
                 answers[key] = st.value
             else:
                 answers[key] = None
@@ -43,13 +55,8 @@ class CaseSheetFields:
 
     @staticmethod
     def _empty(value: Any) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return value.strip() == ""
-        if isinstance(value, (list, tuple, dict)):
-            return len(value) == 0
-        return False
+        # Kept as a thin alias for any external callers.
+        return is_empty(value)
 
 
 class MergeEngine:
@@ -65,7 +72,7 @@ class MergeEngine:
             value = extracted.get(key)
             if value is None:
                 continue
-            if self._empty(value):
+            if is_empty(value):
                 continue
             state = self.fields.states[key]
             if state.confirmed:
@@ -100,10 +107,5 @@ class MergeEngine:
 
     @staticmethod
     def _empty(value: Any) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return value.strip() == ""
-        if isinstance(value, (list, tuple, dict)):
-            return len(value) == 0
-        return False
+        # Kept as a thin alias for any external callers.
+        return is_empty(value)

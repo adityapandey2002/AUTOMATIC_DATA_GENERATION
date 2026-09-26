@@ -36,21 +36,25 @@ const SECTIONS = [
   },
 ];
 
+// `pending` is the auto-filled-but-not-yet-confirmed state. It is blue in every
+// section on purpose: the colour means "the scribe wrote this, check it", which
+// is the same signal everywhere. Section identity is carried by `dot`/`label`,
+// and a human-confirmed value goes teal (see `confirmed` in FieldTile).
 const ACCENT = {
   sky: {
     dot: "bg-sky-400",
     label: "text-sky-700",
-    pending: "border-sky-200 bg-sky-50/60",
+    pending: "border-blue-200 bg-blue-50/70",
   },
   brand: {
     dot: "bg-brand-500",
     label: "text-brand-700",
-    pending: "border-brand-200 bg-brand-50/60",
+    pending: "border-blue-200 bg-blue-50/70",
   },
   violet: {
     dot: "bg-violet-400",
     label: "text-violet-700",
-    pending: "border-violet-200 bg-violet-50/60",
+    pending: "border-blue-200 bg-blue-50/70",
   },
 };
 
@@ -126,7 +130,7 @@ function FieldTile({ field, section, value, confirmed, onConfirm }) {
             confirmed
               ? "text-brand-800"
               : filled
-              ? "text-slate-800"
+              ? "text-blue-800"
               : "text-slate-300"
           }`}
         >
@@ -140,7 +144,7 @@ function FieldTile({ field, section, value, confirmed, onConfirm }) {
       {filled && !confirmed && (
         <button
           onClick={() => onConfirm(field.key)}
-          className="mt-2 w-full flex items-center justify-center gap-1.5 rounded-lg bg-brand-600 hover:bg-brand-700 active:scale-[0.98] text-white text-xs font-bold px-3 py-1.5 transition-all shadow-sm"
+          className="mt-2 w-full flex items-center justify-center gap-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white text-xs font-bold px-3 py-1.5 transition-all shadow-sm"
         >
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" strokeWidth="3" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />

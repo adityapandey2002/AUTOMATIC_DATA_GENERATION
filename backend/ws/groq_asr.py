@@ -104,7 +104,11 @@ class GroqWhisperASR:
             "language": (None, whisper_lang),
             "response_format": (None, "verbose_json"),
             "temperature": (None, "0"),
-            "timestamp_granularities[]": (None, "word"),
+            # MUST be "segment": asking for "word" granularity returns a `words`
+            # array with no confidence fields AND suppresses `segments` entirely,
+            # so avg_logprob / no_speech_prob / compression_ratio were never
+            # available and every downstream gate silently passed.
+            "timestamp_granularities[]": (None, "segment"),
         }
         if context and context.strip():
             # Groq's prompt is token-limited (~224 tokens) even though the HTTP
@@ -135,9 +139,15 @@ class GroqWhisperASR:
     def _parse_response(self, result: dict) -> dict:
         text = result.get("text", "") or ""
         segments = result.get("segments", []) or []
-        avg_logprob = 0.0
-        no_speech_prob = 0.0
-        compression_ratio = 0.0
+        # Missing metrics MUST stay None. These used to default to 0.0, which
+        # is the *best possible* value for every downstream gate (0.0 > 0.6 is
+        # False, 0.0 < -1.5 is False, 0.0 > 2.4 is False), so a response with no
+        # segments at all was treated as maximally confident and bypassed every
+        # check. None makes the gates skip, as they already do for providers
+        # that expose no confidence metrics.
+        avg_logprob: Optional[float] = None
+        no_speech_prob: Optional[float] = None
+        compression_ratio: Optional[float] = None
         logprobs = []
         no_speech_probs = []
         compression_ratios = []

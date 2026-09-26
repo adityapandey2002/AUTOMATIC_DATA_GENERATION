@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import array
 import base64
+import inspect
 import json
 import logging
 import math
+import re
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -39,6 +42,135 @@ from storage.audio import log_deletion
 logger = logging.getLogger(__name__)
 
 
+def _accepts_context(provider) -> bool:
+    """Whether this provider's transcribe_chunk() takes a `context` kwarg.
+
+    Only Groq and local faster-whisper use the prompt-context carry; the
+    Sarvam/Bhashini/IndicConformer adapters do not. We introspect the signature
+    once per provider class instead of catching TypeError, which used to also
+    swallow genuine TypeErrors raised *inside* a provider body and silently
+    retry it with fewer arguments — turning a real bug into a no-op.
+    """
+    try:
+        params = inspect.signature(provider.transcribe_chunk).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins/C-extensions
+        return False
+    if "context" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# Cache of provider class -> bool, so the signature is inspected once per class
+# rather than once per chunk per provider.
+_CONTEXT_SUPPORT: dict[type, bool] = {}
+
+
+def _provider_context_args(provider, context: str) -> dict:
+    cls = type(provider)
+    supported = _CONTEXT_SUPPORT.get(cls)
+    if supported is None:
+        supported = _accepts_context(provider)
+        _CONTEXT_SUPPORT[cls] = supported
+    return {"context": context} if supported else {}
+
+
+# --- Prompt-echo (hallucination) detection --------------------------------
+#
+# Whisper fed near-silence does not return nothing: it regurgitates the prompt
+# it was given. We always append `hi_prompt_terms` (a comma-separated domain
+# vocabulary) to bias Hindi decoding, so a quiet chunk comes back as e.g.
+#   "प्रसव पीड़ा, सामान्य प्रसव पीडा, रेफर, डिस्चार्ज"
+# which local_fill() then turns into a FABRICATED delivery_mode and
+# final_outcome on the case sheet.
+#
+# This is not catchable by confidence gating: measured against the live API,
+# that hallucination comes back avg_logprob=-0.149, no_speech_prob=0.113,
+# compression_ratio=0.82 — i.e. Whisper is *confidently* wrong and clears every
+# logprob/no-speech threshold. Only comparing the output against the prompt we
+# injected catches it.
+
+_ECHO_MIN_TOKENS = 3      # below this, "सामान्य प्रसव" is a real answer
+_ECHO_REPEAT_MIN_TOKENS = 2
+_ECHO_FRAGMENT_MIN_CHARS = 3
+
+# Devanagari + Latin word characters; everything else is separator.
+_WORD_RE = re.compile(r"[ऀ-ॿa-z0-9]+", re.IGNORECASE)
+
+
+def _echo_tokens(text: str) -> list[str]:
+    return _WORD_RE.findall(text or "")
+
+
+def _echo_norm(text: str) -> str:
+    """Lowercased, punctuation-free, whitespace-collapsed form for comparison."""
+    return " ".join(_WORD_RE.findall((text or "").lower()))
+
+
+def is_echo_fragment(text: str, echoes: Optional[set[str]]) -> bool:
+    """True when `text` is a piece of an echo we already rejected.
+
+    Once Whisper starts regurgitating the prompt it drifts *within* the
+    hallucinated phrase — the 4-term echo "प्रसव पीड़ा, सामान्य प्रसव पीड़ा,
+    रेफर, डिस्चार्ज" is followed by the bare fragment "पीड़ा". A single word
+    can't be judged on content (a patient may legitimately answer
+    "सीज़ेरियन"), but it can be recognised as a substring of a known echo.
+    """
+    if not echoes:
+        return False
+    norm = _echo_norm(text)
+    if len(norm) < _ECHO_FRAGMENT_MIN_CHARS:
+        return False
+    return any(norm in echo for echo in echoes)
+
+
+def is_prompt_echo(
+    text: str,
+    prompt: str,
+    seen: Optional[set[str]] = None,
+    echoes: Optional[set[str]] = None,
+) -> bool:
+    """True when `text` looks like the model echoing `prompt` rather than speech.
+
+    `seen` is the set of normalised transcripts already accepted this session;
+    an identical repeat is treated as a hallucination too, since a fixed prompt
+    makes the model emit the same phrase over and over. `echoes` is the set of
+    already-rejected echoes, used to catch follow-on fragments.
+
+    Deliberately biased toward precision. "सामान्य प्रसव" and "प्रसव पीड़ा" are
+    BOTH two-word literal substrings of the vocabulary and are structurally
+    indistinguishable by content, so the content rules require three words and
+    only the repeat rule — which needs two — operates at the shorter length.
+    Dropping a genuine second mention costs a duplicate line in the
+    transcript; keeping a hallucination fabricates the clinical record.
+    """
+    if is_echo_fragment(text, echoes):
+        return True
+
+    norm = _echo_norm(text)
+    tokens = _echo_tokens(text)
+    if not tokens:
+        return False
+
+    # 1. Verbatim repeat of an earlier accepted chunk from the same prompt.
+    if seen and len(tokens) >= _ECHO_REPEAT_MIN_TOKENS and norm in seen:
+        return True
+
+    if len(tokens) < _ECHO_MIN_TOKENS or not prompt:
+        return False
+
+    prompt_tokens = set(_echo_tokens(prompt))
+    # 2. Every single word came out of the injected vocabulary.
+    if prompt_tokens and all(t in prompt_tokens for t in tokens):
+        return True
+    # 3. The utterance is a literal slice of the vocabulary string. Real speech
+    #    is never a verbatim substring of a comma-separated word list.
+    prompt_norm = _echo_norm(prompt)
+    if prompt_norm and norm in prompt_norm:
+        return True
+    return False
+
+
+
 class ChunkSession:
     def __init__(self) -> None:
         self.groq = GroqWhisperASR()
@@ -52,12 +184,31 @@ class ChunkSession:
         self.chunk_ids: list[int] = []
         self.transcript_buffer: list[str] = []
         self.active: bool = False
+        # Normalised transcripts already accepted this session, for repeat-
+        # hallucination detection. Bounded so a long encounter can't grow it
+        # without limit.
+        self._seen_transcripts: set[str] = set()
+        # Normalised texts already identified as prompt echoes, so follow-on
+        # fragments of the same hallucination are caught too.
+        self._echo_transcripts: set[str] = set()
 
     def reset(self, encounter_id: str = "") -> None:
         self.encounter_id = encounter_id
         self.chunk_ids = []
         self.transcript_buffer = []
+        self._seen_transcripts = set()
+        self._echo_transcripts = set()
         self.merge.reset()
+
+    def _remember(self, transcript: str) -> None:
+        if len(self._seen_transcripts) > 400:
+            self._seen_transcripts.clear()
+        self._seen_transcripts.add(_echo_norm(transcript))
+
+    def _remember_echo(self, transcript: str) -> None:
+        if len(self._echo_transcripts) > 50:
+            self._echo_transcripts.clear()
+        self._echo_transcripts.add(_echo_norm(transcript))
 
     def _provider_order(self, language: str) -> list:
         """Order ASR providers by best-fit for the spoken language."""
@@ -120,7 +271,19 @@ class ChunkSession:
             return "dropped"
         return None
 
-    async def process_chunk(self, payload: dict) -> Optional[dict]:
+    def _live_window(self) -> str:
+        """Transcript tail used for the per-chunk local fill.
+
+        Bounded to the last N chunks so the ~30 regex passes in local_fill()
+        don't re-scan the whole encounter on every chunk. MergeEngine keeps
+        anything found in older chunks, so narrowing the window only limits
+        how far back a *correction* can be picked up live — finalize() re-scans
+        the full transcript regardless.
+        """
+        window = max(1, settings.local_fill_window_chunks)
+        return " ".join(self.transcript_buffer[-window:])
+
+    async def process_chunk(self, payload: dict, pcm_level: Optional[float] = None) -> Optional[dict]:
         if not self.active:
             return None
 
@@ -131,7 +294,12 @@ class ChunkSession:
         self.chunk_ids.append(chunk_id)
         context = self._prompt_context(language)
 
-        pcm_level = _pcm_level(pcm_b64)
+        # RMS is a full base64 decode + pure-Python sum over every sample, so it
+        # is computed once here and reused for both the log line and the gate.
+        # The caller may pass a value it already computed for the voice-activity
+        # broadcast, in which case we reuse that instead of decoding again.
+        if pcm_level is None:
+            pcm_level = _pcm_level(pcm_b64)
         logger.info(
             "Chunk %d: len=%s dur=%sms js_rms=%.4f raw_rms=%.4f anlz_rms=%.4f anySignal=%s ctxRate=%s dev=%r@%s level=%.4f",
             chunk_id,
@@ -161,7 +329,6 @@ class ChunkSession:
         }
 
         # Cheap pre-ASR silence gate: don't burn a cloud call on quiet/noise.
-        pcm_level = _pcm_level(pcm_b64)
         if not pcm_b64 or pcm_level < settings.min_pcm_level_for_speech:
             return empty_payload
 
@@ -172,11 +339,14 @@ class ChunkSession:
         for provider in self._provider_order(language):
             try:
                 result = await provider.transcribe_chunk(
-                    pcm_b64, language=language, duration_ms=duration_ms, context=context
+                    pcm_b64,
+                    language=language,
+                    duration_ms=duration_ms,
+                    **_provider_context_args(provider, context),
                 )
-            except TypeError:
-                result = await provider.transcribe_chunk(pcm_b64, language=language)
             except Exception as e:
+                # Real errors (including TypeErrors from inside the adapter)
+                # now surface here instead of being masked by a retry shim.
                 logger.warning(
                     "%s failed for chunk %d: %s",
                     type(provider).__name__,
@@ -214,12 +384,30 @@ class ChunkSession:
             )
             return empty_payload
         if gate == "dropped":
+            logprob = asr_result.get("avg_logprob")
             logger.info(
                 "Chunk %d dropped (low confidence, %s avg_logprob=%.2f): %r",
                 chunk_id,
                 provider_name,
-                asr_result.get("avg_logprob", float("nan")),
+                logprob if logprob is not None else float("nan"),
                 transcript[-80:],
+            )
+            return empty_payload
+
+        # Prompt-echo guard. Whisper handed near-silence returns the domain
+        # vocabulary we injected rather than silence, and confidence gating
+        # cannot catch it (the echo comes back avg_logprob ~ -0.15). Left in
+        # place it fabricates delivery_mode / final_outcome on the case sheet,
+        # so it must be dropped here, before local_fill ever sees it.
+        if is_prompt_echo(transcript, context, self._seen_transcripts, self._echo_transcripts):
+            self._remember_echo(transcript)
+            logger.info(
+                "Chunk %d rejected as prompt echo (dur=%dms pcm_level=%.4f prov=%s): %r",
+                chunk_id,
+                duration_ms,
+                pcm_level,
+                provider_name,
+                transcript[:80],
             )
             return empty_payload
 
@@ -235,10 +423,11 @@ class ChunkSession:
         )
 
         self.transcript_buffer.append(transcript)
-        full_transcript = " ".join(self.transcript_buffer)
+        self._remember(transcript)
 
-        # Per-chunk: free local bilingual field filler (instant, no API quota)
-        filled = local_fill(full_transcript)
+        # Per-chunk: free local bilingual field filler (instant, no API quota).
+        # Scoped to a bounded tail window — see _live_window().
+        filled = local_fill(self._live_window())
         self.merge.merge(filled, chunk_id)
         snapshot = self.merge.get_snapshot()
         validation_alerts = validate_case_sheet(snapshot)
@@ -262,6 +451,9 @@ class ChunkSession:
         full_transcript = " ".join(self.transcript_buffer)
 
         # Free local fill always runs first — fields already set locally stay.
+        # NOTE: deliberately the FULL transcript, not the live window. This is
+        # the one pass that can pair a question in one chunk with its answer in
+        # another, and it runs once per patient, so the cost is irrelevant.
         filled = local_fill(full_transcript)
         self.merge.merge(filled, -1)
 
@@ -385,7 +577,75 @@ class ChunkSession:
 
 dashboard_clients: set[WebSocket] = set()
 capture_clients: set[WebSocket] = set()
-current_session: Optional[ChunkSession] = None
+
+
+class SessionRegistry:
+    """Maps encounter_id -> ChunkSession.
+
+    This replaces a single module-level `current_session` global, which let the
+    capture agent and the dashboard end up pointing at *different* ChunkSession
+    objects for the same encounter — and let a dashboard `mic_start` call
+    reset() the very session the capture agent was streaming into, silently
+    discarding the transcript collected so far.
+
+    Sessions are keyed by encounter_id so both transports converge on the same
+    object. `_active` tracks which one is currently recording, because a
+    capture agent that has not yet announced an encounter_id still needs the
+    dashboard's mic_start/mic_stop to address it.
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict[str, ChunkSession] = {}
+        self._active: Optional[ChunkSession] = None
+
+    @staticmethod
+    def _key(encounter_id: str) -> str:
+        return (encounter_id or "").strip()
+
+    def resolve(self, encounter_id: str = "") -> ChunkSession:
+        """Get the session for this encounter, creating it if unseen.
+
+        With no encounter_id we fall back to the currently-active session, so a
+        dashboard that doesn't know the id (capture-agent mode) still reaches
+        the running recording instead of orphaning it.
+        """
+        key = self._key(encounter_id)
+        if key:
+            existing = self._by_id.get(key)
+            if existing is not None:
+                return existing
+            session = ChunkSession()
+            session.encounter_id = key
+            self._by_id[key] = session
+            return session
+        if self._active is not None:
+            return self._active
+        return self.set_active(ChunkSession())
+
+    def set_active(self, session: ChunkSession) -> ChunkSession:
+        self._active = session
+        key = self._key(session.encounter_id)
+        if key:
+            self._by_id[key] = session
+        return session
+
+    @property
+    def active(self) -> Optional[ChunkSession]:
+        return self._active
+
+    def get(self, encounter_id: str) -> Optional[ChunkSession]:
+        return self._by_id.get(self._key(encounter_id))
+
+    def release(self, session: ChunkSession) -> None:
+        """Drop a session once its transport is gone and it isn't recording."""
+        if self._active is session:
+            self._active = None
+        key = self._key(session.encounter_id)
+        if key and self._by_id.get(key) is session:
+            del self._by_id[key]
+
+
+sessions = SessionRegistry()
 
 
 def _pcm_level(pcm_b64: str) -> float:
@@ -420,20 +680,24 @@ async def broadcast_to_dashboard(message: dict) -> None:
 
 async def ws_chunks_handler(websocket: WebSocket) -> None:
     """Capture-agent endpoint. Runs ASR -> extraction and broadcasts live."""
-    global current_session
     await websocket.accept()
     capture_clients.add(websocket)
     await broadcast_capture_status()
-    session = ChunkSession()
-    current_session = session
+    # Bound lazily on the first payload that names an encounter, so an agent
+    # and a dashboard referring to the same encounter share one ChunkSession.
+    session: Optional[ChunkSession] = None
 
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
 
+            incoming_id = str(data.get("encounter_id") or "").strip()
+
             if data.get("type") == "finalize":
-                session.encounter_id = data.get("encounter_id", session.encounter_id)
+                session = session or sessions.resolve(incoming_id)
+                if incoming_id:
+                    session.encounter_id = incoming_id
                 result = await session.finalize()
                 await websocket.send_text(json.dumps(result))
                 await broadcast_to_dashboard(result)
@@ -441,14 +705,20 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
                 break
 
             if data.get("type") == "session_start":
+                session = sessions.resolve(incoming_id)
                 session.active = True
-                session.encounter_id = data.get("encounter_id", "")
-                session.reset(session.encounter_id)
+                session.reset(session.encounter_id or incoming_id)
+                sessions.set_active(session)
                 await broadcast_to_dashboard({"type": "session_state", "active": True, "encounter_id": session.encounter_id})
                 continue
 
-            if "encounter_id" in data:
-                session.encounter_id = data["encounter_id"]
+            # Re-resolve if this payload names a different encounter than the
+            # one we were already filling (e.g. a browser-mic run switching id).
+            if session is None or (incoming_id and incoming_id != session.encounter_id):
+                session = sessions.resolve(incoming_id)
+            if incoming_id:
+                session.encounter_id = incoming_id
+                sessions.set_active(session)
 
             # First audio chunk implicitly starts the session (the capture agent
             # does not send session_start), so chunks are never dropped.
@@ -461,6 +731,8 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
                     "encounter_id": session.encounter_id,
                 })
 
+            # One RMS pass, reused for the voice-activity broadcast AND the
+            # in-handler silence gate.
             voice_level = _pcm_level(data.get("pcm_b64", ""))
             await broadcast_to_dashboard({
                 "type": "voice_activity",
@@ -468,7 +740,7 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
                 "encounter_id": session.encounter_id,
             })
 
-            result = await session.process_chunk(data)
+            result = await session.process_chunk(data, pcm_level=voice_level)
             if result is None:
                 # Not recording — drain silently so the agent keeps its socket.
                 continue
@@ -484,32 +756,32 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
     finally:
         capture_clients.discard(websocket)
         await broadcast_capture_status()
-        if current_session is session:
-            current_session = None
-        session.active = False
+        if session is not None:
+            session.active = False
+            sessions.release(session)
 
 
 async def ws_dashboard_handler(websocket: WebSocket) -> None:
     """Dashboard endpoint — commands from the health worker + live updates."""
-    global current_session
     await websocket.accept()
     dashboard_clients.add(websocket)
 
     try:
         # Send current state on connect (snapshot of the running session)
-        if current_session is not None:
-            snapshot = current_session.merge.get_snapshot()
-            if current_session.active:
+        active = sessions.active
+        if active is not None:
+            snapshot = active.merge.get_snapshot()
+            if active.active:
                 await websocket.send_text(json.dumps({
                     "type": "session_state",
                     "active": True,
-                    "encounter_id": current_session.encounter_id,
+                    "encounter_id": active.encounter_id,
                 }))
             await websocket.send_text(json.dumps({
                 "type": "snapshot",
                 "answers": snapshot["answers"],
                 "confirmed": snapshot["_confirmed"],
-                "transcript": " ".join(current_session.transcript_buffer[-8:]),
+                "transcript": " ".join(active.transcript_buffer[-8:]),
             }))
         await broadcast_capture_status()
 
@@ -519,10 +791,16 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
             msg_type = data.get("type")
 
             if msg_type == "mic_start":
-                session = current_session or ChunkSession()
-                current_session = session
-                session.active = True
-                session.reset(data.get("encounter_id", ""))
+                requested = str(data.get("encounter_id") or "").strip()
+                session = sessions.resolve(requested)
+                # Only reset a session that isn't already recording. Previously
+                # this unconditionally called reset(), so a health worker
+                # clicking "Start" while the capture agent was streaming wiped
+                # the in-progress transcript.
+                if not session.active:
+                    session.active = True
+                    session.reset(requested or session.encounter_id)
+                sessions.set_active(session)
                 logger.info("Recording started (encounter %s)", session.encounter_id)
                 await broadcast_to_dashboard({
                     "type": "session_state",
@@ -531,8 +809,9 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
                 })
 
             elif msg_type == "mic_stop":
-                if current_session and current_session.active:
-                    result = await current_session.finalize()
+                session = sessions.active
+                if session and session.active:
+                    result = await session.finalize()
                     await broadcast_to_dashboard(result)
                 else:
                     await broadcast_to_dashboard({"type": "session_state", "active": False})
@@ -540,10 +819,9 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
             elif msg_type == "set_field":
                 field = data.get("field", "")
                 value = data.get("value")
-                if current_session is None:
-                    current_session = ChunkSession()
-                if current_session.set_field(field, value):
-                    snapshot = current_session.merge.get_snapshot()
+                session = sessions.active or sessions.resolve()
+                if session.set_field(field, value):
+                    snapshot = session.merge.get_snapshot()
                     await broadcast_to_dashboard({
                         "type": "field_updated",
                         "field": field,
@@ -552,13 +830,10 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
                     })
 
             elif msg_type == "save":
-                session = current_session
-                if session is None:
-                    session = ChunkSession()
-                    current_session = session
+                session = sessions.active or sessions.resolve()
                 if not session.encounter_id:
-                    import uuid as _uuid
-                    session.encounter_id = str(_uuid.uuid4())
+                    session.encounter_id = str(uuid.uuid4())
+                    sessions.set_active(session)
                 snapshot = session.merge.get_snapshot()
                 validation_alerts = validate_case_sheet(snapshot)
                 db = SessionLocal()
@@ -579,7 +854,8 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
             elif msg_type == "confirm_field":
                 # Kept for wire compatibility; UI no longer sends this.
                 field = data.get("field", "")
-                if current_session and current_session.confirm(field):
+                session = sessions.active
+                if session and session.confirm(field):
                     await broadcast_to_dashboard({
                         "type": "field_confirmed",
                         "field": field,

@@ -17,3 +17,6 @@ build/
 *.log
 *.out.log
 *.err.log
+
+# Machine-specific local docs (never pushed; per-machine paths & versions)
+docs/GUIDES/*.LOCAL.md

@@ -2,14 +2,18 @@ import asyncio
 import base64
 import io
 import json
+import os
 import sys
 
 import numpy as np
 import soundfile as sf
 import websockets
 
-GNM = r"C:\Users\ADITYA\AppData\Local\Temp\opencode\qa_gnm.mp3"
-PATIENT = r"C:\Users\ADITYA\AppData\Local\Temp\opencode\qa_patient.mp3"
+# Fixtures live in the per-user temp dir. These used to be hardcoded
+# C:\Users\ADITYA\... paths that only resolved on the authoring machine.
+FIXTURES = os.path.join(os.environ.get("TEMP", "."), "opencode")
+GNM = os.path.join(FIXTURES, "qa_gnm.mp3")
+PATIENT = os.path.join(FIXTURES, "qa_patient.mp3")
 WS_URL = "ws://127.0.0.1:8765/ws/chunks"
 
 
@@ -23,6 +27,12 @@ def load_16k(path: str):
 
 
 async def main():
+    for p in (GNM, PATIENT):
+        if not os.path.exists(p):
+            print(f"SKIP: no fixture at {p}")
+            print("      Record qa_gnm.mp3 (question) and qa_patient.mp3 (answer)")
+            print(f"      into {FIXTURES}, or see docs/GUIDES/local-run.md")
+            return 0
     g = load_16k(GNM)
     p = load_16k(PATIENT)
     gap = np.zeros(2400, dtype="float32")  # 150ms between speakers

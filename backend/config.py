@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     # digital silence. Kept low so quiet-but-real speech is never dropped.
     min_pcm_level_for_speech: float = 0.004
 
+    # Live per-chunk extraction window, in chunks. local_fill() re-scans the
+    # transcript with ~30 regex passes, so running it over the whole
+    # accumulated buffer on every chunk is O(n^2) over an encounter. The live
+    # path therefore only re-scans the last N chunks; MergeEngine already
+    # retains everything found earlier (latest-non-empty-wins never clears a
+    # field), so nothing is lost. finalize() always re-scans the FULL
+    # transcript, which is where cross-chunk Q&A pairing is finally resolved.
+    local_fill_window_chunks: int = 12
+
     # Per-chunk prompt carry: prepend tail of previous accepted transcript and
     # append the Hindi maternity domain vocabulary last (Whisper bias).
     prompt_tail_characters: int = 600
