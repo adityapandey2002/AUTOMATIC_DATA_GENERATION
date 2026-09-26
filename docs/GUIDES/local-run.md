@@ -4,6 +4,45 @@
 
 How to run and verify the Ambient Clinical AI Scribe locally on Windows.
 
+## Fresh clone bootstrap (new machine / new checkout)
+
+`.venv`, `venv`, `node_modules`, `.env` are gitignored — a fresh clone needs setup:
+
+```powershell
+git clone https://github.com/adityapandey2002/AUTOMATIC_DATA_GENERATION.git
+cd AUTOMATIC_DATA_GENERATION
+
+# Python venv (developed on 3.14.7; 3.11–3.14 should work)
+py -3.14 -m venv backend\venv
+backend\venv\Scripts\python.exe -m pip install -U pip
+
+# Backend + capture-agent deps (one venv)
+backend\venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+backend\venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+backend\venv\Scripts\python.exe -m pip install -r capture-agent\requirements.txt
+
+# Environment
+copy .env.example .env   # then edit:
+#   GROQ_API_KEY, GEMINI_API_KEY  -> real keys
+#   LLM_MODEL=gemini-3.5-flash    -> mandatory (1.5-flash = 404)
+#   DATABASE_URL                  -> DELETE/comment the line (falls back to SQLite scribe.db;
+#                                     example value points at a Postgres you may not run)
+#   LLM_FINAL_EXTRACT=false       -> optional: fully offline, local fill only
+
+# Frontend
+cd web; npm install; cd ..
+```
+
+Then continue with the 3-terminal quick start below.
+
+### Fresh-clone gotchas
+- Port busy (`Errno 10048`): an old uvicorn is holding 8765 — kill it first (see Stop commands).
+- Dashboard URL is `http://localhost:3000` (IPv6 localhost), not `127.0.0.1:3000`.
+- NeMo not installed → IndicConformer inert (graceful); Sarvam/Bhashini keys empty → those providers skip.
+- Gemini free tier = 20 req/day; Groq ASR ≈ 2000 req/day (prompt capped at 850 UTF-8 bytes).
+- After editing `backend/form_schema.py`, regenerate the JS mirror:
+  `cd backend && venv\Scripts\python.exe export_schema_js.py`
+
 ## Quick start (3 terminals, in order)
 
 ### 1. Backend (must be first) — port 8765
