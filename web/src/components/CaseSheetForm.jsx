@@ -228,7 +228,15 @@ function Editor({ field, value, onCommit, onCancel }) {
   );
 }
 
-function FieldTile({ field, value, onEdit }) {
+// Colour semantics (carried over from the deleted draft vitals renderer): a tile
+// with an unconfirmed draft value is blue wherever it appears — blue means
+// "the scribe wrote this, check it". A human-confirmed value goes teal
+// (brand) with the OK mark, mirroring `confirmed` from the backend snapshot
+// (backend/engine/merge.py): a locked cell is immune to later auto-fill, and
+// a manual edit (set_field) re-locks it. There is deliberately no Confirm
+// button: locking a field via the backend's confirm_field command would be a
+// new outgoing message, which is a product decision not yet made.
+function FieldTile({ field, value, confirmed, onEdit }) {
   const [editing, setEditing] = useState(false);
   const filled = !isEmptyValue(value);
   const shown = displayValue(value) || "—";
@@ -249,18 +257,28 @@ function FieldTile({ field, value, onEdit }) {
       className={`rounded-xl border p-3 transition-all cursor-text ${
         wide ? "col-span-2 md:col-span-3" : ""
       } ${
-        filled
+        confirmed
+          ? "border-brand-300 bg-brand-50"
+          : filled
           ? "border-blue-200 bg-blue-50/70"
           : "border-slate-200 bg-slate-50/60"
       } ${editing ? "ring-2 ring-brand-400 border-brand-400" : "hover:border-brand-300"}`}
     >
       <div className="flex items-center justify-between gap-1">
         <div className="min-w-0">
-          <span className={`block text-[10px] font-extrabold uppercase tracking-wider truncate ${filled ? "text-blue-700" : "text-slate-500"}`}>
+          <span className={`block text-[10px] font-extrabold uppercase tracking-wider truncate ${confirmed ? "text-brand-700" : filled ? "text-blue-700" : "text-slate-500"}`}>
             {field.label_en}
           </span>
           <span className="block text-[10px] text-slate-400 truncate">{field.label_hi}</span>
         </div>
+        {confirmed && (
+          <span className="shrink-0 flex items-center gap-0.5 text-brand-700 text-[10px] font-bold">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" strokeWidth="3" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+            </svg>
+            OK
+          </span>
+        )}
       </div>
 
       <div className="mt-1">
@@ -269,7 +287,7 @@ function FieldTile({ field, value, onEdit }) {
         ) : (
           <span
             className={`block text-lg font-extrabold tracking-tight truncate ${
-              filled ? "text-blue-800" : "text-slate-300"
+              confirmed ? "text-brand-800" : filled ? "text-blue-800" : "text-slate-300"
             }`}
             title={filled ? shown : undefined}
           >
@@ -281,10 +299,14 @@ function FieldTile({ field, value, onEdit }) {
   );
 }
 
-export default function CaseSheetForm({ schema, answers, onEdit, onSave, saving, saveStatus }) {
+export default function CaseSheetForm({ schema, answers, confirmed, onEdit, onSave, saving, saveStatus }) {
   const getValue = useCallback(
     (key) => answers?.[key] ?? null,
     [answers]
+  );
+  const isConfirmed = useCallback(
+    (key) => Boolean(confirmed?.[key]),
+    [confirmed]
   );
 
   if (!schema) return null;
@@ -331,6 +353,7 @@ export default function CaseSheetForm({ schema, answers, onEdit, onSave, saving,
                   key={f.key}
                   field={f}
                   value={getValue(f.key)}
+                  confirmed={isConfirmed(f.key)}
                   onEdit={onEdit}
                 />
               ))}
