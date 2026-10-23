@@ -1,6 +1,6 @@
 # Backend Codemap
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-10-14
 
 FastAPI + WebSockets service. Bilingual Hindi/English ambient scribe backend.
 Runs from `backend/` dir with `backend/venv` (Python 3.14.7).
@@ -10,18 +10,27 @@ Runs from `backend/` dir with `backend/venv` (Python 3.14.7).
 | File | Purpose |
 |------|---------|
 | `backend/main.py` | FastAPI app (`title="Ambient Clinical AI Scribe"`, v0.1.0), CORS `*`, lifespan `init_db()` |
-| `backend/ws/handler.py` | The core: `ChunkSession`, `/ws/chunks`, `/ws/dashboard`, broadcasts, persistence |
+| `backend/ws/handler.py` | The core: `ChunkSession`, `/ws/chunks`, `/ws/dashboard`, broadcasts, persistence (869 lines) |
+| `backend/ws/asr.py` | ASR failover module — injects/orders the five adapters, owns `context`, availability, min-chunk policy, retry, normalisation → `Transcript` |
+| ackend/ws/protocol.py | WebSocket wire protocol — one canonical home for every event/command shape (constructors + parser) |
+| ackend/engine/enrichment.py | Enrichment module — transcript + mode -> snapshot + alerts; owns live-window vs full, merge order, LLM seam, validation |
+| ackend/db/repository.py | Encounter repository — idempotent replace, answers->Patient mapping, deletion audit (injected session factory) |
 | `backend/engine/local_fill.py` | Free deterministic bilingual field filler (runs every chunk) |
-| `backend/form_schema.py` | Bilingual case-sheet schema, single source of truth (40 fields, 5 sections) |
+| `backend/form_schema.py` | Bilingual case-sheet schema, single source of truth (181 unique fields / 30 sections / 205 declarations) |
+| `backend/fhir/mapper.py` | FHIR R4 mapper — stub for Phase 2 govt reporting (not imported by main.py) |
+| `backend/api/__init__.py` | Empty (0 bytes) — planned REST namespace |
 
 ## HTTP / WS Routes
 
 | Route | Method | Handler | Purpose |
 |-------|--------|---------|---------|
 | `/health` | GET | `health()` | `{"status": "ok"}` |
-| `/api/schema` | GET | `schema()` | Servers `FORM_SCHEMA` (the web fetches this at boot) |
+| `/api/schema` | GET | `schema()` | Serves `FORM_SCHEMA` (the web fetches this at boot) |
+| `/api/patients` | GET | `patients()` | List of patient summaries (no pagination, no auth) |
 | `/ws/chunks` | WS | `ws_chunks_handler()` | Capture agent/audio streaming, live extraction + broadcast |
 | `/ws/dashboard` | WS | `ws_dashboard_handler()` | Health-worker dashboard: control + live updates |
+
+> **Note:** `backend/api/__init__.py` exists but is 0 bytes — the intended place for a larger REST layer that was never written.
 
 ## WS Protocol (message shapes)
 
@@ -62,10 +71,26 @@ Every `chunk_result` / `finalize_result` **is now sent back to the requesting ch
 
 ## ASR Provider Chain (`ws/`)
 
-Provider order in `ChunkSession._provider_order()`:
-- if language is IndicConformer-supported (`mai`/`mag`/`bho`/`vajjika`):
-  `IndicConformer → Groq → Sarvam → Bhashini → local whisper`
-- otherwise: `Groq → Sarvam → Bhashini → IndicConformer → local whisper`
+`ws/asr.py` owns audio → transcript. `ChunkSession` builds one
+`AsrFailover.from_settings([GroqWhisperASR(), SarvamASR(), BhashiniASR(),
+IndicConformerASR(), LocalWhisperASR()])` and calls
+`AsrFailover.transcribe(pcm_b64, language, duration_ms, context) -> Transcript | None`.
+The module owns provider ordering, `context` passing, availability, the
+minimum-chunk-length policy, retry of transient failures, and normalisation. It
+returns a frozen `Transcript(text, provider, language, speaker, avg_logprob,
+no_speech_prob, compression_ratio)` — there is no single `confidence` field.
+
+Ordering is declarative: `sorted by (specialist-first, priority)`. A provider
+whose `supports(language)` is `True` (only IndicConformer, for
+`mai`/`mag`/`bho`/`vajjika`) is tried first; the rest follow by priority
+(`groq=10, sarvam=20, bhashini=30, indicconformer=40, local=90`). For `hi` the
+order is `Groq → Sarvam → Bhashini → IndicConformer → local`; for `mai` it is
+`IndicConformer → Groq → Sarvam → Bhashini → local`.
+
+The five providers below are injected adapters behind that seam — each satisfies
+one interface: `name`, `priority`, `min_chunk_ms`, `available`, `supports(language)`,
+and `transcribe_chunk(pcm_b64, language, duration_ms, context)` returning a parsed
+dict or raising `AsrError`.
 
 | Provider | File | Config | Notes |
 |----------|------|--------|-------|
@@ -75,10 +100,10 @@ Provider order in `ChunkSession._provider_order()`:
 | IndicConformer | `ws/indicconformer_asr.py` | `use_indic_conformer`, `indic_maithili_model` | NeMo toolkit NOT installed → degrades gracefully (falls through) |
 | Local whisper | `ws/local_asr.py` | `use_local_fallback`, `whisper_model_size` | faster-whisper small/int8/cpu |
 
-Audio gating in `_gate_result()`: silence rejection via `no_speech_prob` or server-side PCM RMS
-(`min_pcm_level_for_speech`); hallucination via `avg_logprob`/`compression_ratio`. Prompt carry:
-`_prompt_context()` prepends transcript tail (600 chars) + Hindi domain terms, capped at 800 chars
-(under Groq's 896 limit) for `hi`.
+Audio gating in `_gate_result()` (now takes a `Transcript`): silence rejection via
+`no_speech_prob` or server-side PCM RMS (`min_pcm_level_for_speech`); hallucination via
+`avg_logprob`/`compression_ratio`. Prompt carry: `_prompt_context()` prepends transcript tail
+(600 chars) + Hindi domain terms, capped at 800 chars (under Groq's 896 limit) for `hi`.
 
 ## Extraction Pipeline
 
@@ -157,6 +182,21 @@ list (bilingual). Flags complication/preterm/referred-from/diagnosis keywords/de
 - `test_e2e_live.py` — older; expects `answers`/`confirmed` keys on `chunk_result`.
 - `test_groq_live.py` — direct `GroqWhisperASR` probe.
 - `test_bhashini.py` — requires BHASHINI keys.
+- `test_asr_failover.py` — pure-unit failover suite (36 checks, fake adapters — no network/keys/model/mic): ordering, availability, min-chunk policy, retry, normalisation, `context` passing.
+- `test_groq_retry.py` — now pure-unit Groq adapter failure *classification* (`AsrError.retryable`); the retry loop itself is tested in `test_asr_failover.py`.
+
+## FHIR / API Modules
+
+### `backend/fhir/mapper.py`
+- **Status:** Partially implemented (stub) — docstring says "stub for Phase 2"
+- **Exports:** `map_to_patient(vitals_data: dict) -> dict`, `map_to_observation(vitals_data: dict, patient_id: str) -> list[dict]`
+- **Not imported** by `main.py` or any WS handler — nothing calls it
+- **Stale scaffolding:** reads `vitals_data["PatientDemographics"]["Age"]` shape that no longer exists; hardcodes `"gender": "female"`
+- **Purpose:** Future government reporting integration via FHIR R4
+
+### `backend/api/__init__.py`
+- **Status:** Empty file (0 bytes)
+- **Purpose:** Planned REST namespace — never implemented
 
 ## Related Areas
 

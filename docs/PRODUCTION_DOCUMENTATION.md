@@ -34,7 +34,7 @@
 **Main features / entities:**
 
 - **Live ambient transcription** — two capture paths (standalone agent / browser mic) → `/ws/chunks` → ASR provider chain → gated transcript
-- **Auto-filled case sheet** — 40 fields / 5 sections (registration 5, personal 10, admission 13, delivery 7, outcome 5); source of truth `backend/form_schema.py`
+- **Auto-filled case sheet** — 181 unique fields / 30 sections / 205 declarations (Bihar L3 Maternity Case Sheet); source of truth `backend/form_schema.py`
 - **Free-first extraction** — deterministic bilingual regex (`engine/local_fill.py`) on every chunk; Gemini once per patient at finalize (free tier = 20 req/day)
 - **Human-in-the-loop confirm locks** — worker confirms fields; confirmed fields immutable (`merge.py:71-72`)
 - **Clinical risk validation** — `engine/validate.py` bilingual alerts (age/weight ranges, critical keywords, complication/preterm/death flags)
@@ -116,8 +116,8 @@ encounters (id UUID-str PK, created_at, clinic_id, language_detected,
 
 ```
 PCM chunk → pre-ASR RMS gate (<0.004 → reject, no cloud call)
-  → provider order by language (mai/mag/bho/vajjika → Indic first;
-     else Groq first) → first non-empty text wins
+  → ws/asr.py AsrFailover: specialist-first order (mai/mag/bho/vajjika
+     → IndicConformer first; else Groq first) → first non-empty wins
   → post-ASR gate: no_speech_prob>0.6 ✗ | rms<0.004 ✗ |
      compression_ratio>2.4 ✗ | avg_logprob<-1.5 ✗
   → boundary dedupe (Whisper overlap word)
@@ -156,7 +156,8 @@ local_fill(full) FIRST (free, catches cross-chunk answers)
 
 | Integration | Module + init | Status |
 |---|---|---|
-| **Groq ASR** (Whisper large-v3) | `ws/groq_asr.py:52-55`; POST `api.groq.com/openai/v1/audio/transcriptions` via httpx 45s (L25,86,106) | ✅ Working — free, ~2000 req/day |
+| **ASR failover** (module) | `ws/asr.py` — orders the five adapters (specialist-first, then priority), owns retry (`asr_max_attempts=3`, backoff `asr_retry_backoff_s=0.6`) and the uniform per-attempt `asr_timeout_s`=15s; returns a normalised `Transcript` | ✅ Active — injected adapters |
+| **Groq ASR** (Whisper large-v3) | `ws/groq_asr.py`; POST `api.groq.com/openai/v1/audio/transcriptions` via httpx, timeout `asr_timeout_s`=15s | ✅ Working — free, ~2000 req/day |
 | **Google Gemini LLM** | `llm/extract.py`: `google.genai.Client(api_key=...)` (L142); `client.aio.models.generate_content` (L195) | ✅ Working, throttled — 20 req/day; `LLM_MODEL=gemini-3.5-flash` required (1.5-flash retired) |
 | **Sarvam AI (Saaras v3)** | `ws/sarvam_asr.py:47`; POST `api.sarvam.ai/speech-to-text` (L19) | ⚠️ Placeholder — key empty → instant skip |
 | **Bhashini Dhruva** | `ws/bhashini_asr.py:60-63`; POST `dhruva-api.bhashini.gov.in/.../pipeline` (L30) | ⚠️ Placeholder — key + User-ID empty |
@@ -244,13 +245,15 @@ All test scripts live in `backend/` (no `tests/` dir anywhere):
 | `backend/test_e2e_live.py` | Live e2e | 0 asserts | Encodes/streams mock audio over WS |
 | `backend/test_groq_live.py` | Live smoke | 0 asserts | Direct Groq transcription check |
 | `backend/test_bhashini.py` | Live smoke | 0 asserts | Bhashini API (skips if no key) |
+| `backend/test_asr_failover.py` | Unit | **36 checks** | Pure-unit (fake adapters, no network/keys/model/mic): ordering, availability, min-chunk policy, retry, normalisation, `context` passing |
+| `backend/test_groq_retry.py` | Unit | **20 checks** | Pure-unit (`httpx` faked): Groq adapter failure *classification* (`AsrError.retryable`); the retry loop lives in `ws/asr.py` |
 
 ### 4.2 Coverage gaps
 
 - **No unit tests** for `local_fill`, `merge`, `validate` beyond the integration smoke
-- **No frontend tests** � `web/package.json` has no `test` script; no vitest/jest/playwright
-- **No CI/CD** � no `.github/workflows`, no azure-pipelines, no Jenkinsfile (glob-verified)
-- **No linters/formatters/type-checkers** � no ruff, black, flake8, mypy, eslint, prettier configs
+- **No frontend tests** � `web/package.json` has no `test` script; no vitest/jest/playwright
+- **No CI/CD** � no `.github/workflows`, no azure-pipelines, no Jenkinsfile (glob-verified)
+- **No linters/formatters/type-checkers** � no ruff, black, flake8, mypy, eslint, prettier configs
 - **No pre-commit**, no coverage tooling
 - No tests for: WS handler branches, DB idempotent persist, Gemini 429 failover, capture agent VAD, browser mic path
 
@@ -313,20 +316,20 @@ No single aggregate runner (`pytest` not installed).
 | Sarvam/Bhashini keys empty | Those providers always skip | Documented placeholder status |
 | Groq free tier (~2000 req/day) | High-volume clinics may throttle | Local faster-whisper fallback in chain |
 | No Alembic | Schema changes require `drop_all`/manual DDL | `create_all` on boot only adds tables |
-| CORS `*` + credentials, **no auth** | Any origin can open `/ws/dashboard` and confirm fields | High risk � restrict origins, add token before multi-user |
+| CORS `*` + credentials, **no auth** | Any origin can open `/ws/dashboard` and confirm fields | High risk � restrict origins, add token before multi-user |
 | No structured logging/APM | Incidents hard to diagnose | stderr only; no Sentry/Datadog |
 | No health-based orchestration | Manual start order matters (backend ? web ? agent) | `/health` exists but unused by probes |
 
 ### 6.2 Monitoring & observability
 
-- **Health:** `GET /health` ? `{"status":"ok"}` (`main.py:47-49`) � not wired into docker healthcheck
+- **Health:** `GET /health` ? `{"status":"ok"}` (`main.py:47-49`) � not wired into docker healthcheck
 - **Logging:** default uvicorn/logging to stderr; detached-launch pattern redirects to log files (backend.log, etc.)
 - **Alerts (clinical, not ops):** `Alert` table + `alerts` broadcast; DPDP `AudioDeletionLog` audit rows
 - **No** metrics endpoint, no Prometheus, no distributed tracing, no log aggregation
 
 ### 6.3 Backup & data retention
 
-- Dev: single file `backend/scribe.db` � must be volume-mounted in compose (Postgres has named volume)
+- Dev: single file `backend/scribe.db` � must be volume-mounted in compose (Postgres has named volume)
 - Audio: transients not persisted after finalize; optional `log_deletion` writes DPDP audit
 - No scheduled backups, no snapshot scripts, no DR runbook
 
@@ -367,7 +370,7 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 
 ---
 
-## Appendix A � Gap checklist (recommended before production)
+## Appendix A � Gap checklist (recommended before production)
 
 - [ ] Add authentication (session token) + tighten CORS to dashboard origin only
 - [ ] Pin backend requirements (currently unpinned ranges) and align Docker Python (3.12) with dev (3.14)
@@ -380,14 +383,16 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 - [ ] Wire FHIR mapper for Phase 2 reporting
 - [ ] Production-grade audio deletion job + backup cron for Postgres
 
-## Appendix B � Key file index
+## Appendix B � Key file index
 
 ```
 backend/
   main.py                 FastAPI app, routes, CORS, lifespan
   config.py               settings (llm_model, llm_final_extract, groq_model)
   form_schema.py          40-field bilingual schema (source of truth)
-  ws/handler.py           ChunkSession, gates, local_fill/Gemini, _persist, broadcast
+  ws/handler.py           ChunkSession, gates, enrichment, persistence, broadcast (ASR via ws/asr.py; WS shapes via ws/protocol.py)
+  ws/asr.py               ASR failover module (ordering, context, retry, normalisation)
+  ws/protocol.py          WebSocket wire protocol (one canonical home for every event/command shape)
   ws/groq_asr.py          Groq Whisper ASR
   ws/sarvam_asr.py        Sarvam Saaras (placeholder)
   ws/bhashini_asr.py      Bhashini Dhruva (placeholder)
@@ -396,9 +401,11 @@ backend/
   engine/local_fill.py    free bilingual regex filler
   engine/merge.py         latest-wins + confirm locks
   engine/validate.py      clinical alert rules
+  engine/enrichment.py    enrichment module (transcript + mode -> snapshot + alerts; owns live-window, merge order, LLM seam, validation)
   llm/extract.py          Gemini extractor + 429/403/404 failover
   db/models.py            6 tables
   db/connection.py        engine + create_all
+  db/repository.py        encounter repository (idempotent replace, answers->Patient, deletion audit)
   integration_test.py     7 asserts
   test_qa_live.py         live Q&A e2e (prints)
 web/
@@ -416,4 +423,4 @@ docs/
 
 ---
 
-*End of report. Sections marked analysis-only; run commands verified in-session 2026-09-24. Deploy topology inferred from `deploy/` assets and env templates � confirm exact Dockerfile paths if they differ.*
+*End of report. Sections marked analysis-only; run commands verified in-session 2026-09-24. Deploy topology inferred from `deploy/` assets and env templates � confirm exact Dockerfile paths if they differ.*

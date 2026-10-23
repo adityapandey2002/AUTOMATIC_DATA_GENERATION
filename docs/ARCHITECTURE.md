@@ -4,7 +4,7 @@
 **Domain:** Bilingual (Hindi/English) ambient scribe for Bihar L1 PHC maternity case sheets
 ("Maternity Services Case Sheet", State Health Society, Bihar)
 **Stack:** `backend/` = FastAPI + WebSockets + SQLAlchemy/SQLite (`:8765`) · `web/` = React + Vite (`:3000`) · `capture-agent/` = standalone mic recorder (Python)
-**Schema:** 40 fields / 5 sections — single source of truth = `backend/form_schema.py`
+**Schema:** 181 unique fields / 30 sections (205 declarations) — single source of truth = `backend/form_schema.py`
 
 ---
 
@@ -18,7 +18,7 @@
 4. [Key Design Trade-Offs](#4-key-design-trade-offs)
 5. [Full Encounter Sequence Diagram](#5-full-encounter-sequence-diagram)
 6. [Data Model / Schema](#6-data-model--schema)
-7. [Case Sheet Schema (40 fields / 5 sections)](#7-case-sheet-schema-40-fields--5-sections)
+7. [Case Sheet Schema (181 unique fields / 30 sections / 205 declarations)](#7-case-sheet-schema-181-unique-fields--30-sections--205-declarations)
 8. [WS Message Protocol](#8-websocket-message-protocol)
 9. [Architectural Risks & Gaps](#9-architectural-risks--gaps)
 10. [Run & Management Cheat-Sheet](#10-run--management-cheat-sheet)
@@ -101,7 +101,7 @@ The dashboard keeps a second socket `/ws/dashboard` purely for control + broadca
 
 - JSON case-sheet extraction, ONE call per patient at finalize
 - `temperature=0`, `response_mime_type=application/json`, 2048 max output tokens, 30 s HTTP timeout
-- Prompt = `EXTRACTION_PROMPT` (bilingual rules) + `build_schema_prompt_text()` (40 fields w/ bilingual labels + enum options) + transcript
+- Prompt = `EXTRACTION_PROMPT` (bilingual rules) + `build_schema_prompt_text()` (181 unique fields / 30 sections w/ bilingual labels + enum options) + transcript
 - **Free tier: 20 req/day — this constraint drives the entire architecture**
 - Self-heal ladder: 429 PerDay → block model for today → fail over to `gemini-3.6-flash → gemini-3.7-flash → gemini-3.5-flash-lite` (own pools, `extract.py:59-63, 223-233`); 403/404 → permanently skip; all exhausted → all-`None` (local fill survives)
 - `llm_final_extract=True` config toggle: flip False → fully offline
@@ -134,8 +134,11 @@ The dashboard keeps a second socket `/ws/dashboard` purely for control + broadca
 ### Effective runtime chain (graph)
 
 ```
-LANGUAGE ROUTING — handler._provider_order()
-─────────────────────────────────────────────
+LANGUAGE ROUTING — ws/asr.py AsrFailover.order(lang)
+────────────────────────────────────────────────────
+  Declarative order: sorted by (specialist-first, priority).
+  supports() promotes IndicConformer for mai/mag/bho/vajjika;
+  local carries priority 90, so it always runs last.
 
   language ∈ {mai, mag, bho, vajjika}:
   ┌──────────────────┐   empty    ┌──────────────┐   empty    ┌──────────┐
@@ -206,7 +209,7 @@ LANGUAGE ROUTING — handler._provider_order()
                                              │ pass                                           │
                                              ▼                                                │
                                     ┌─ ② PROVIDER SELECTION ───┐                             │
-                                    │ _provider_order(lang)    │                             │
+                                    │ asr.transcribe(lang)     │                             │
                                     │ first non-empty wins ────┼──────────────────────────────┤
                                     └──────────────────────────┘   transcribe(WAV, language=hi,│
                                              ▲                     verbose_json, prompt)      │
@@ -292,7 +295,7 @@ LANGUAGE ROUTING — handler._provider_order()
   │   extract(full) =                 │                            │
   │    EXTRACTION_PROMPT +            │                            │
   │    build_schema_prompt_text() +   │ ──── generate_content ────▶│
-  │    transcript                     │ ◄── JSON {40 fields} ──────┘
+  │    transcript                     │ ◄── JSON {181 fields} ─────┘
   │   temp=0, json mime, 2048 tokens  │
   │                                   │  429 PerDay?
   │   self-heal ladder:               │   → block model for today
@@ -354,7 +357,7 @@ The Gemini key is capped at **~20 requests/day**, while a single maternity encou
 | **Local fill every chunk + Gemini once at finalize** | **$0 live, 1/finalize** | **High enough (regex covers most)** | **~1 patient/day minimum, ladder → 80** |
 | Gemini at finalize only | $0 live | Poor (0 fields until finalize) | 1/finalize |
 
-**`local_fill`** is a deterministic, zero-latency, zero-quota regex filler on **every** chunk (and again first at finalize), enough to fill most of the 40 fields live so the health worker sees the sheet populate in real time.
+**`local_fill`** is a deterministic, zero-latency, zero-quota regex filler on **every** chunk (and again first at finalize), enough to fill most of the **181 fields** live so the health worker sees the sheet populate in real time.
 
 **Gemini** is reserved for a **single** schema-prompted pass at finalize for exactly the cases regex is bad at — ambiguous phrasing, indirect answers, code-mixed Maithili, cross-sentence question/answer pairing.
 
@@ -457,7 +460,7 @@ The single-call-at-finalize bottleneck exists purely because of the 20 req/day c
      │                  │  (or browser stop() → flush → finalize msg)              │            │           │
      │                  │             │                      │ local_fill AGAIN (free, first)   │           │
      │                  │             │                      │──ONE Gemini extract (temp=0)────▶│           │
-     │                  │             │                      │◀─JSON{40 fields}──(429→next model/local)──│  │
+     │                  │             │                      │◀─JSON{181 fields}──(429→next model/local)──│  │
      │                  │             │                      │ merge → validate    │            │           │
      │                  │             │                      │ _persist (DELETE-then-INSERT, idempotent)────────▶
      │                  │             │                      │ log_deletion (DPDP audit) ─────────────────────▶│
@@ -519,17 +522,20 @@ if encounter_id set:
 
 ---
 
-## 7. Case Sheet Schema (40 fields / 5 sections)
+## 7. Case Sheet Schema (181 unique fields / 30 sections / 205 declarations)
 
 **Source of truth:** `backend/form_schema.py` (Python dict) → served at `GET /api/schema` → mirrored in `web/src/formSchema.js`
+
+The schema contains **24 literal section blocks + 6 generated `doctor_notes_1..6` sections** (built via list comprehension).
 
 | # | Section (id) | Title (EN) | Title (HI) | Fields |
 |---|-------------|-----------|-----------|--------|
 | 1 | `registration` | Registration Details | पंजीकरण विवरण | mcts_rch_number, ipd_number, bpl_jsy_registered, aadhaar_number, referred_from (5) |
 | 2 | `personal` | Personal & Contact Details | व्यक्तिगत एवं संपर्क विवरण | name, spouse_parent_of, age, address, block, district, health_centre, contact_phone, contact_phone_hc, asha_name (10) |
-| 3 | `admission` | Admission & Medical Status | भर्ती एवं चिकित्सीय स्थिति | admission_date, admission_time, admission_category, marital_status, birth_attendant, lmp, edd, **pregnancy_complication, anc_checkup_done, anc_visits** (added this session), provisional_diagnosis, final_diagnosis, contraceptive_history (13) |
+| 3 | `admission` | Admission & Medical Status | भर्ती एवं चिकित्सीय स्थिति | admission_date, admission_time, admission_category, marital_status, birth_attendant, lmp, edd, pregnancy_complication, anc_checkup_done, anc_visits, provisional_diagnosis, final_diagnosis, contraceptive_history (13) |
 | 4 | `delivery` | Delivery & Baby | प्रसव एवं शिशु | delivery_mode, delivery_outcome, babies_count, birth_weight_kg, preterm, baby_sex, immunization (7) |
 | 5 | `outcome` | Final Outcome | अंतिम परिणाम | final_outcome, final_date_time, provider_name, provider_designation, provider_phone (5) |
+| 6–30 | `doctor_notes_1` ... `doctor_notes_6` + additional clinical sections | (various) | (various) | 141 fields across clinical exam, partograph, newborn care, postnatal, danger signs, referrals, etc. |
 
 **Field types:** `text`, `yesno`, `number`, `date`, `time`, `select` (w/ bilingual options), `wide` (spans full tile row)
 
@@ -538,6 +544,8 @@ if encounter_id set:
 - `ALL_FIELDS`, `FIELD_BY_KEY` → flat indexes for merge/validate
 
 **New this session:** `anc_checkup_done` (yesno, "एएनसी जांच हुई" / "ANC checkup done"), `anc_visits` (number, "एएनसी जांचों की संख्या" / "Number of ANC visits")
+
+> ⚠️ **Previous versions of this document stated "40 fields / 5 sections".** The official Bihar L3 Maternity Case Sheet (commit `bb54ff7`) expanded the schema to 30 sections / 181 unique keys / 205 declarations. Trust `backend/form_schema.py`, not stale docs.
 
 ---
 
@@ -603,14 +611,14 @@ if encounter_id set:
 | 1b | ~~**Whisper prompt echo fabricated clinical fields**~~ **RESOLVED** | ✅ Fixed | Was the most dangerous defect found: Whisper handed near-silence does not return nothing, it **regurgitates the prompt**. Because we always append `hi_prompt_terms` (a comma-separated domain vocabulary) as a decoding hint, a quiet chunk returned `" प्रसव पीड़ा, सामान्य प्रसव पीड़ा, रेफर, डिस्चार्ज"`, and `local_fill()` turned that into `{'delivery_mode': 'Normal', 'final_outcome': 'Referral'}` — a fabricated delivery mode *and* outcome on a maternity case sheet, for a patient who had said nothing. **Confidence gating provably cannot catch this**: measured against the live API the echo returns `avg_logprob=-0.149`, `no_speech_prob=0.113`, `compression_ratio=0.82`, i.e. Whisper is *confidently* wrong and clears every threshold. Fixed by `is_prompt_echo()` / `is_echo_fragment()` in `handler.py`, which compare the output against the prompt actually injected, plus verbatim-repeat and echo-fragment detection. The 3-word content threshold is deliberate: `प्रसव पीड़ा` (hallucination) and `सामान्य प्रसव` (a genuine patient answer = `delivery_mode: Normal`) are *both* two-word literal substrings of the vocabulary and are indistinguishable by content, so tightening to 2 words would suppress real clinical answers. The residual — a first, isolated two-word echo — is accepted: it extracts no fields and cannot repeat. Pinned by `test_prompt_echo_rejected`, `test_echo_threshold_tradeoff`, `test_echo_fragment_cascade` and `test_echo_live.py`. |
 | 1c | ~~**Missing ASR metrics read as perfect confidence**~~ **RESOLVED** | ✅ Fixed | Two compounding bugs made the whole confidence gate a no-op for Groq. (a) The request asked for `timestamp_granularities[]=word`, which returns a `words` array carrying *no* probability fields **and suppresses `segments` entirely** — so `avg_logprob` / `no_speech_prob` / `compression_ratio` were never available. (b) `_parse_response()` then defaulted those missing values to `0.0`, which is the *best possible* value for all three gates (`0.0 > 0.6` False, `0.0 < -1.5` False, `0.0 > 2.4` False), so a response with no segments was treated as maximally confident and bypassed every check. Fixed by requesting `segment` granularity and returning `None` for genuinely absent metrics, so absence is no longer encoded as certainty. Consequence worth noting: the `tentative` status could never fire for Groq before this fix. |
 | 1d | ~~**Capture agent never read its own socket**~~ **RESOLVED** | ✅ Fixed | The reported symptom was "the mic keeps recording but nothing gets transcribed after a line or two", with `Chunks client disconnected` repeating in the backend log. Root cause: `ChunkStreamer` only ever called `send()`. `websocket-client` processes control frames — **ping, pong, close** — exclusively inside `recv()`, and the backend replies to every accepted chunk (`handler.py:749`) and pings periodically. So the agent never drained those replies, never auto-ponged, and the server dropped the connection on ping timeout. The agent then reconnected, so audio kept flowing while the session appeared stalled. Fixed with a daemon reader thread (`streamer.py:_read_loop`) that drains the socket, treats `WebSocketTimeoutException` as an idle-but-healthy poll, and retires the connection on a real close so the next chunk reconnects and spools instead of being silently written into a dead TCP buffer. Socket timeout raised `10s → 30s` so it also bounds a send. Pinned by a before/after test against a local server with `ping_interval=5s`: old client needed 2 connections, new client held 1 for the whole run. |
-| 1e | ~~**A single dropped request ended transcription**~~ **RESOLVED** | ✅ Fixed | Compounding with risk 4 and the local fallback's weights being absent, Groq was the *only* working engine, so one hiccup lost that chunk permanently. The live log showed a request hanging 19s and then `Groq transcription failed:` — with **nothing after the colon**, because the code logged `str(e)` and several httpx/asyncio exceptions stringify to the empty string. Three fixes: (a) `transcribe_chunk` now retries timeouts, connection errors, `429` and `5xx` with exponential backoff (`asr_max_attempts=3`, `asr_timeout_s=15`, `asr_retry_backoff_s=0.6`), while deliberately **not** retrying other `4xx` — a bad credential fails identically every time and retrying only stalls the encounter; (b) the exception **type** is always logged, so the line is diagnosable; (c) the old fixed `45s` timeout was tightened to `15s`, because 3 × 45s would have frozen a live encounter for over two minutes. Pinned by `test_groq_retry.py` (21 checks, `httpx` faked, no quota spent). |
+| 1e | ~~**A single dropped request ended transcription**~~ **RESOLVED** | ✅ Fixed | Compounding with risk 4 and the local fallback's weights being absent, Groq was the *only* working engine, so one hiccup lost that chunk permanently. The live log showed a request hanging 19s and then `Groq transcription failed:` — with **nothing after the colon**, because the code logged `str(e)` and several httpx/asyncio exceptions stringify to the empty string. Three fixes: (a) a transient failure (timeout, connection error, `429`, `5xx`) is now retried with exponential backoff by the ASR failover module (`ws/asr.py`; `asr_max_attempts=3`, `asr_timeout_s=15`, `asr_retry_backoff_s=0.6`), while other `4xx` is deliberately **not** retried — a bad credential fails identically every time and retrying only stalls the encounter; (b) the exception **type** is always logged, so the line is diagnosable; (c) the old fixed `45s` timeout was tightened to `15s`, because 3 × 45s would have frozen a live encounter for over two minutes. Pinned by `test_groq_retry.py` (20 checks, `httpx` faked, no quota spent), which now pins the adapter's failure *classification*; the retry loop itself is covered by `test_asr_failover.py` (36 checks). |
 | 1f | ~~**Field answers were written into the patient's name**~~ **RESOLVED** | ✅ Fixed | A three-chunk encounter persisted the name as **`शिवानी सामान्य`**. The strict name capture class `[\u0900-\u097F\w\s-]{2,40}?` includes spaces, so it ran to the end of the sentence; the loop keeps the *last* match and `merge()` is latest-wins, so the most polluted version is what got written to `patients.name`. `सामान्य` and `एलएमपी` are not name parts. Compounding it, `NEXT_QUESTION_RE` knew only the Latin `"LMP"` while Whisper emits the Devanagari **`एलएमपी`**, so the boundary never fired on real ASR output at all. Fixed by bounding the name span three ways — a character window (`_NAME_WINDOW_CHARS`), `NEXT_QUESTION_RE` (now carrying the Devanagari spellings the model actually produces), and a new `NAME_STOP_RE` hard stop on clinical vocabulary — applied to *both* the strict and the `_answer_name` path. `NAME_STOP_RE` terms carry a trailing `BD`, because a bare `प्री` (intended for "pre-term") also matches inside **`प्रीति`** and silently destroyed a real patient's name. Pinned by `test_name_does_not_absorb_field_answers` and `test_name_stop_words_are_word_bounded`. |
 | 1g | ~~**Local whisper fallback was permanently inert**~~ **RESOLVED** | ✅ Fixed | Risk 4's "slow CPU fallback" did not exist at all. The `Systran/faster-whisper-small` snapshot was missing `model.bin` (a 0-byte `.incomplete` blob) after the hub fetch died on a transient DNS failure, so every fallback attempt re-paid the download timeout. Two further defects sat behind it: `local_asr` returned `getattr(info, "avg_logprob", 0.0)` — the **same "missing metric reads as perfect confidence" bug as 1c**, since `0.0` is the best possible logprob — and it logged failures as `str(e)`, producing the same undiagnosable bare `LocalWhisper transcription failed:` line. Now: weights cached (461MB, fetched with `HF_HUB_DISABLE_XET=1` after the Xet/CAS backend failed with `File reconstruction error`), absent metrics return `None`, the exception type is always logged, and after 3 consecutive failures with no model the fallback **disables itself** instead of stalling every later chunk. Verified offline by `test_local_whisper_offline.py` (`HF_HUB_OFFLINE=1`). Caveat: `small`/int8 on CPU runs ~5.5× realtime, so this is a safety net, not a live path. |
 | 2 | **No authentication** | 🔴 High | CORS `allow_origins=["*"]` + `allow_credentials=True` (`main.py:38-44`); both WS endpoints accept unauthenticated connections. PHI (Aadhaar, phone, name, diagnosis) exposed. |
 | 3 | **Gemini quota hot-spot** | 🟡 Medium | 20 req/day hard ceiling. Failover ladder masks across 4 models (~80/day) but all same free key. `_daily_quota_blocked` is in-process memory — restart forgets blocked models. |
 | 4 | **Chain degrades to 2 providers** | 🟡 Medium | IndicConformer (NeMo/Py3.14), Sarvam (key empty), Bhashini (key empty) all inert → effective chain = Groq → local whisper. Both remaining legs are now genuinely functional and Groq retries transient failures (1e, 1g), but Groq is still a single point of failure for the whole product. |
 | 5 | **Persist not fully transactional** | 🟡 Medium | `_persist()` commits, then `log_deletion()` opens separate commit. Crash between → encounter persisted but no deletion-audit row. |
-| 6 | **Local fill coverage gap** | 🟡 Medium | ~20 of 40 fields have no regex rule (MCTS/RCH, IPD, admission category, EDD, diagnoses, contraceptive history, provider/outcome) — only fill if Gemini succeeds. |
+| 6 | **Local fill coverage gap** | 🟡 Medium | ~100 of 181 fields have no regex rule (MCTS/RCH, IPD, admission category, EDD, diagnoses, contraceptive history, provider/outcome, clinical exam, partograph, newborn care, postnatal, danger signs, referrals) — only fill if Gemini succeeds. |
 | 7 | **BD-lookahead fragility** | 🟠 Low-Med | Future contributor adding `\b` reintroduces silent failures. Now covered by `test_local_fill.py` (97 offline checks), which asserts `local_fill` outputs directly — including a `test_bd_boundary_not_word_boundary` case pinning the exact failure mode, and `test_name_stop_words_are_word_bounded` for the same trap in `NAME_STOP_RE`. |
 | 8 | **No diarization** | 🟠 Low-Med | `speaker="mixed"` persisted. Stereo channel exists "for future" but attribution not implemented — GNM vs patient disambiguated only by regex heuristics. |
 | 9 | **Audio retention** | 🟢 Low | `AUDIO_DELETE_AFTER_TRANSCRIBE=true` writes audit row only; chunks never stored server-side (transient in WS payload) — mostly no-op audit entry. |
@@ -682,33 +690,36 @@ BHASHINI_API_KEY=          # empty
 |------|------|
 | `backend/main.py` | FastAPI app, `/health`, `/api/schema`, WS route registration |
 | `backend/config.py` | Pydantic settings (models, keys, toggles) |
-| `backend/form_schema.py` | 40-field bilingual schema (single source) |
-| `backend/ws/handler.py` | ChunkSession, provider chain, gates, merge, validate, persist |
+| `backend/form_schema.py` | 181 unique fields / 30 sections / 205 declarations bilingual schema (single source) |
+| `backend/ws/handler.py` | ChunkSession — ASR via `ws/asr.py`, enrichment via `engine/enrichment.py`, persistence via `db/repository.py`, wire shapes via `ws/protocol.py` |
+| `backend/ws/asr.py` | ASR failover module — injected adapters, specialist-first order, context, retry, normalisation → `Transcript` |
 | `backend/ws/groq_asr.py` | Groq Whisper adapter |
 | `backend/ws/indicconformer_asr.py` | IndicConformer adapter (inert) |
 | `backend/ws/local_asr.py` | faster-whisper fallback |
 | `backend/ws/sarvam_asr.py` | Sarvam adapter (key empty) |
 | `backend/ws/bhashini_asr.py` | Bhashini adapter (key empty) |
 | `backend/llm/extract.py` | Gemini extractor + self-heal ladder |
-| `backend/engine/local_fill.py` | Free bilingual regex field-filler |
+| `backend/engine/enrichment.py` | Enrichment module — transcript + mode -> snapshot + alerts; owns live-window vs full, merge order, LLM seam, validation |
+| `backend/db/repository.py` | Encounter persistence — idempotent replace, answers->Patient mapping, deletion audit (injected session factory) |
+| `backend/ws/protocol.py` | WebSocket message protocol — one canonical home for every event/command shape |
 | `backend/engine/merge.py` | MergeEngine (latest-wins, confirm locks) |
 | `backend/engine/validate.py` | Case-sheet validation rules |
 | `backend/db/models.py` | SQLAlchemy 6 tables |
 | `backend/db/connection.py` | SessionLocal factory |
-| `backend/storage/audio.py` | AudioDeletionLog (DPDP) |
+| `backend/db/repository.py` | Encounter persistence (idempotent replace, answers->Patient, deletion audit) |
 | `capture-agent/main.py` | Recorder → denoise → VAD → streamer entry |
 | `capture-agent/vad.py` | Silero VAD chunker (512-sample frames) |
 | `capture-agent/streamer.py` | WS chunk sender |
 | `web/src/App.jsx` | Dashboard root, WS handlers, mic Start/Stop |
 | `web/src/formSchema.js` | Mirror of FORM_SCHEMA |
-| `web/src/components/CaseSheetForm.jsx` | 40-field tile grid, confirm UI |
+| `web/src/components/CaseSheetForm.jsx` | 181-field / 30-section tile grid, confirm UI |
 | `web/src/components/TranscriptPanel.jsx` | Live transcript bubbles |
 | `web/src/components/AlertBanner.jsx` | Validation alerts |
 | `web/src/hooks/useBrowserMic.js` | Browser mic → RMS-VAD → WS |
 | `web/vite.config.js` | Dev proxy /api + /ws → 127.0.0.1:8765 |
 | `capture-agent/probe.py` | Mic device enumeration |
 | `backend/fhir/mapper.py` | Answers → FHIR-shaped mapping |
-| `web/src/components/VitalsForm.jsx` | Vitals entry form |
+| `backend/db/repository.py` | Encounter persistence (idempotent replace, answers->Patient, deletion audit) |
 | `web/src/components/PatientsList.jsx` | Saved-patient list view |
 | `backend/test_local_fill.py` | Unit tests: local_fill, merge, live window, provider introspection, session registry |
 | `docs/CODEMAPS/*.md` | Per-area codemaps (INDEX, backend, database, capture-agent, frontend) |
@@ -717,4 +728,4 @@ BHASHINI_API_KEY=          # empty
 
 ---
 
-**Sources:** `docs/CODEMAPS/backend.md`, `INDEX.md`, `capture-agent.md`, `database.md`, `frontend.md`; `backend/ws/handler.py`; `backend/engine/{local_fill,merge,validate}.py`; `backend/llm/extract.py`; `backend/form_schema.py`; `backend/config.py`; `backend/main.py`; `backend/ws/{groq,indicconformer,local,sarvam,bhashini}_asr.py`; `backend/db/models.py`; `backend/storage/audio.py`; `capture-agent/{main,streamer,vad}.py`; `web/src/App.jsx`; `web/src/components/CaseSheetForm.jsx`; `web/src/hooks/useBrowserMic.js`; `.env` (secrets masked).
+**Sources:** `docs/CODEMAPS/backend.md`, `INDEX.md`, `capture-agent.md`, `database.md`, `frontend.md`; `backend/ws/handler.py`; `backend/engine/{local_fill,merge,validate}.py`; `backend/engine/enrichment.py`; `backend/llm/extract.py`; `backend/form_schema.py`; `backend/config.py`; `backend/main.py`; `backend/ws/{groq,indicconformer,local,sarvam,bhashini}_asr.py`; `backend/ws/asr.py`; `backend/ws/protocol.py`; `backend/db/models.py`; `backend/db/repository.py`; `capture-agent/{main,streamer,vad}.py`; `web/src/App.jsx`; `web/src/components/CaseSheetForm.jsx`; `web/src/hooks/useBrowserMic.js`; `.env` (secrets masked).

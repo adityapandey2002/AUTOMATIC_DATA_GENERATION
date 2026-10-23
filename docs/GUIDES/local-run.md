@@ -1,6 +1,6 @@
 # Run & Usage Guide — Windows
 
-**Last Updated:** 2026-09-25
+**Last Updated:** 2026-10-14
 
 How to run and verify the Ambient Clinical AI Scribe locally on Windows.
 
@@ -47,21 +47,21 @@ Then continue with the 3-terminal quick start below.
 
 ### 1. Backend (must be first) — port 8765
 ```powershell
-cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\backend
+cd AUTOMATIC_DATA_GENERATION\backend
 venv\Scripts\python.exe -m uvicorn main:app --port 8765 --host 127.0.0.1
 ```
 Verify: `Invoke-WebRequest http://127.0.0.1:8765/health` → `{"status":"ok"}`
 
 ### 2. Web dashboard — port 3000
 ```powershell
-cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\web
+cd AUTOMATIC_DATA_GENERATION\web
 npm run dev
 ```
 Open **http://localhost:3000** — note: binds IPv6 localhost, `127.0.0.1:3000` will NOT work.
 
 ### 3. Capture agent (mic) — run from repo ROOT
 ```powershell
-cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT
+cd AUTOMATIC_DATA_GENERATION
 backend\venv\Scripts\python.exe capture-agent\main.py --language hi --encounter-id demo
 ```
 
@@ -81,7 +81,7 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 
 ### Run tests (backend must be running, no mic needed)
 ```powershell
-cd C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\backend
+cd AUTOMATIC_DATA_GENERATION\backend
 venv\Scripts\python.exe integration_test.py
 ```
 
@@ -97,20 +97,20 @@ venv\Scripts\python.exe integration_test.py
 
 ## 1. Start the backend
 
-Run dir **MUST be `backend/`** (config/relative DB path depends on it):
+Run dir **MUST be `AUTOMATIC_DATA_GENERATION/backend/`** (config/relative DB path depends on it):
 
 ```powershell
-cd backend
+cd AUTOMATIC_DATA_GENERATION\backend
 venv\Scripts\python.exe -m uvicorn main:app --port 8765 --host 127.0.0.1
 ```
 
-Behind the scenes: `lifespan` calls `init_db()` (creates tables in `scribe.db`), CORS `*`.
-REST: `GET /health` → `{"status":"ok"}`, `GET /api/schema` → schema.
+Behind the scenes: `lifespan` calls `init_db()` (creates tables in SQLite `scribe.db` locally / PostgreSQL in Docker), CORS `*`.
+REST: `GET /health` → `{"status":"ok"}`, `GET /api/schema` → schema, `GET /api/patients` → patient list.
 
 ## 2. Start the web dashboard
 
 ```powershell
-cd web
+cd AUTOMATIC_DATA_GENERATION\web
 npm run dev
 ```
 
@@ -121,7 +121,7 @@ each can be confirmed.
 
 ## 3. Capture agent (optional, separate mic machine)
 
-From repo **ROOT**:
+From repo **ROOT** (`AUTOMATIC_DATA_GENERATION/`):
 
 ```powershell
 backend\venv\Scripts\python.exe capture-agent\main.py --language hi --encounter-id demo
@@ -131,12 +131,16 @@ backend\venv\Scripts\python.exe capture-agent\main.py --language hi --encounter-
 
 ## Tests / Demos
 
-Backend must be running on `127.0.0.1:8765`. These are one-shot scripts run from `backend/`:
+Backend must be running on `127.0.0.1:8765`. These are one-shot scripts run from `AUTOMATIC_DATA_GENERATION/backend/`:
 
 | Command | What it does |
 |---------|--------------|
 | `venv\Scripts\python.exe integration_test.py` | /health + /api/schema REST, dashboard mic round-trip, chunks round-trip (**3/3 PASS**) |
 | `venv\Scripts\python.exe test_qa_live.py` | Sends ~45s two-voice Hindi Q&A audio (`qa_gnm.mp3` + `qa_patient.mp3` from `%TEMP%\opencode`) via `/ws/chunks`; prints transcript, live answers, `finalize_result`, alerts — current demo |
+| `venv\Scripts\python.exe test_local_fill.py` | Unit suite (418 lines) — local_fill bilingual extraction, Devanagari BD boundary, script-fidelity gate, MergeEngine latest-wins + confirm-lock, ChunkSession._live_window bounding, SessionRegistry convergence — **no network** |
+| `venv\Scripts\python.exe test_asr_failover.py` | Pure-unit failover suite (**36 checks**, fake adapters — no network/keys/model/mic): ordering, availability, min-chunk policy, retry, normalisation, `context` passing |
+| `venv\Scripts\python.exe test_groq_retry.py` | Pure-unit Groq adapter failure **classification** (`AsrError.retryable`); the retry loop now lives in `ws/asr.py` and is tested in `test_asr_failover.py` |
+| `venv\Scripts\python.exe test_name_saved.py` | Regression test — proves finalize/save actually writes the patient's name |
 | `venv\Scripts\python.exe test_e2e_live.py` | Older; sends `groq_test_hi.mp3`, expects `answers`/`confirmed` keys |
 | `venv\Scripts\python.exe test_groq_live.py` | Direct GroqWhisperASR probe |
 | `venv\Scripts\python.exe test_bhashini.py` | Requires BHASHINI_API_KEY + USER_ID in .env |
@@ -160,7 +164,7 @@ Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "... > log 2>&1"
 
 Example (from repo root):
 ```powershell
-Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "cd /d C:\Users\ADITYA\Downloads\AUTOMATIC_REPORT\backend && venv\Scripts\python.exe -m uvicorn main:app --port 8765 --host 127.0.0.1 > %TEMP%\opencode\backend.log 2>&1"
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "cd /d AUTOMATIC_DATA_GENERATION\backend && venv\Scripts\python.exe -m uvicorn main:app --port 8765 --host 127.0.0.1 > %TEMP%\opencode\backend.log 2>&1"
 ```
 
 ## .env keys / reality notes

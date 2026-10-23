@@ -1,24 +1,26 @@
 # Frontend Codemap (web/)
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-09-26
 
 React 19 + Vite 6 + Tailwind 3.4 dashboard for the health worker. Bilingual (English/Hindi)
 maternity case-sheet UI. Dev binds localhost:3000, proxies `/api` and `/ws` to 127.0.0.1:8765
 (`web/vite.config.js`).
+
+**No router** — single-page, two-tab application with tab state in `App.jsx`.
 
 ## Source Tree
 
 | File | Purpose |
 |------|---------|
 | `src/main.jsx` | React entry (StrictMode, `#root`) |
-| `src/App.jsx` | Main dashboard: WS dashboard socket, mic Start/Stop w/ elapsed timer, message handlers, alerts, layout |
-| `src/formSchema.js` | Bundled mirror of `backend/form_schema.py` (fetched `/api/schema` at boot; fallback) |
-| `src/hooks/useWebSocket.js` | Reconnecting dashboard WS to `ws://host:8765/ws/dashboard` (VITE_WS_URL override) |
-| `src/hooks/useBrowserMic.js` | Browser microphone capture → resample 16k → WS `/ws/chunks`, chunk VAD, finalize on stop |
-| `src/components/CaseSheetForm.jsx` | Bilingual tile grid of all fields; Confirm button per filled field |
+| `src/App.jsx` | Main dashboard: tab state (`'scribe' | 'patients'`), WS dashboard socket, mic Start/Stop w/ elapsed timer, message handlers, alerts, layout |
+| `src/formSchema.js` | Bundled mirror of `backend/form_schema.py` (fetched `/api/schema` at boot; fallback) — **AUTO-GENERATED**, do not edit by hand. Regenerate: `cd backend && venv\Scripts\python.exe export_schema_js.py` |
+| `src/hooks/useWebSocket.js` | Reconnecting dashboard WS to `ws://host:8765/ws/dashboard` (VITE_WS_URL override); resends unacknowledged chunks on reconnect |
+| `src/hooks/useBrowserMic.js` | Browser microphone capture → resample 16k → WS `/ws/chunks`, chunk VAD (RMS threshold 0.002), finalize on stop |
+| `src/components/CaseSheetForm.jsx` | Bilingual tile grid of all **181 fields / 30 sections**; Confirm button per filled field (locks field via WS `confirm_field`) |
 | `src/components/TranscriptPanel.jsx` | Live transcript with per-speaker labels + tentative italics |
 | `src/components/AlertBanner.jsx` | Critical/warning alert banners |
-| `src/components/VitalsForm.jsx` | Legacy vitals form (not wired into current App flow) |
+| `src/components/PatientsList.jsx` | Patient list / encounter history (fetches `GET /api/patients` on mount) |
 | `index.html` | Shell, Inter font, SVG favicon |
 
 ## WS Message Handling (App.jsx)
@@ -50,10 +52,24 @@ Controls sent:
 
 ## Schema Mirror
 
-`web/src/formSchema.js` must stay in sync with `backend/form_schema.py`. New fields added for
-ANC — `anc_checkup_done` (yesno, "ANC checkup done"/"एएनसी जांच हुई") and `anc_visits` (number,
-"Number of ANC visits"/"एएनसी जांचों की संख्या") — mirror the backend exactly. Backend remains
-the single source of truth (`GET /api/schema`).
+`web/src/formSchema.js` is **AUTO-GENERATED** from `backend/form_schema.py` — do not edit by hand.
+Header comment:
+```
+AUTO-GENERATED from backend/form_schema.py — do not edit by hand.
+Regenerate: cd backend && venv\Scripts\python.exe export_schema_js.py
+Bundled mirror used if /api/schema is unreachable; backend is the source of truth.
+```
+
+**Regeneration is a manual step.** Nothing in CI, `package.json`, or the Dockerfile runs
+`export_schema_js.py`, so the two files can silently drift. The app prefers the live
+`/api/schema` response and only falls back to this bundle.
+
+Backend schema: **30 sections, 181 unique field keys, 205 declarations** (including 6 generated `doctor_notes_1..6`).
+
+## No Router
+
+This is a **single-page, two-tab application** — there is no router. Tab state (`'scribe' | 'patients'`)
+is managed directly in `App.jsx` with a simple `useState`. No `react-router` dependency exists.
 
 ## Styling
 

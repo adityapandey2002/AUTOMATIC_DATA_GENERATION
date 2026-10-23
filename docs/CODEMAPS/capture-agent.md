@@ -1,12 +1,12 @@
 # Capture Agent Codemap (capture-agent/)
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-09-26
 
 Standalone client that captures mic audio, denoises, chunks on speech, and streams PCM bytes to
 the backend `/ws/chunks`. Used on a separate clinic laptop (via `deploy/scripts/install-laptop.bat`
 if desired); the web dashboard's browser mic is the in-clinic alternative.
 
-## Pipeline
+## Pipeline (5 modules)
 
 ```
 recorder.py (16kHz stereo USB mic, float32)
@@ -16,16 +16,17 @@ recorder.py (16kHz stereo USB mic, float32)
 └── main.py orchestrates; sends chunks ≥ 300ms; finalize if --encounter-id
 ```
 
-## Modules
+## Modules (5 files)
 
 | File | Purpose |
 |------|---------|
 | `main.py` | CLI orchestration; args: `--backend-url`, `--mic-device`, `--denoiser [auto|deepfilter|rnnoise]`, `--encounter-id`, `--language [hi|mai]` |
 | `recorder.py` | `sounddevice.InputStream`, 16kHz, 2ch (stereo for future diarization), `BLOCK_SIZE=1024` |
 | `denoise.py` | `DeepFilterDenoiser` (df.enhance) + `RNNoiseDenoiser` (rnnoise_demo subprocess); `create_denoiser(backend)` |
-| `probe.py` | CPU/RAM benchmark; `MachineProfile.evaluate()` → deepfilter vs rnnoise |
 | `vad.py` | `VADChunker`: Silero VAD via `torch.hub.load(snakers4/silero-vad)`; 512-sample window @16kHz (256 @8kHz); buffers input; emits `SpeechChunk` (float32 mono, start/end sample, PCM bytes) on silence ≥ 400ms; max 10s speech, 300ms context |
 | `streamer.py` | `ChunkStreamer` (websocket-client): `connect()` retries, `send_chunk()` spools on failure (disconnect/reconnect loop), `send_finalize(encounter_id)` for type `finalize`, `disconnect()` |
+
+> **Note:** `probe.py` is a helper for device enumeration and CPU/RAM benchmarking — not part of the core streaming pipeline.
 
 ## Message Payload
 
