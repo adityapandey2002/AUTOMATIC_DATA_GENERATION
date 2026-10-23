@@ -12,6 +12,7 @@ from typing import Optional
 import httpx
 
 from config import settings
+from ws.asr import AsrError
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ def _pcm_bytes_to_wav(pcm_bytes: bytes, sample_rate: int = 16000, channels: int 
 
 
 class SarvamASR:
+    name = "sarvam"
+    priority = 20
+    min_chunk_ms = 0
+
     def __init__(self) -> None:
         self.api_key = settings.sarvam_api_key
 
@@ -50,13 +55,25 @@ class SarvamASR:
     def _configured(self) -> bool:
         return bool(self.api_key) and self.api_key not in _PLACEHOLDER_KEYS
 
+    @property
+    def available(self) -> bool:
+        return self._configured
+
+    def supports(self, language: str) -> bool:
+        return False
+
     async def transcribe_chunk(
         self,
         pcm_b64: str,
         language: str = "hi-IN",
         duration_ms: int | None = None,
+        context: str = "",
     ) -> dict:
-        """Send a single audio chunk to the Sarvam REST speech-to-text API."""
+        """Send a single audio chunk to the Sarvam REST speech-to-text API.
+
+        `context` is accepted for seam uniformity and ignored: Sarvam has no
+        prompt-biasing input.
+        """
         if not self._configured:
             return {"text": "", "speaker": "unknown", "confidence": 0.0}
 
@@ -64,8 +81,7 @@ class SarvamASR:
             pcm = base64.b64decode(pcm_b64)
             wav_bytes = _pcm_bytes_to_wav(pcm, sample_rate=16000, channels=1)
         except Exception as e:
-            logger.error("Sarvam: could not decode audio chunk: %s", e)
-            return {"text": "", "speaker": "unknown", "confidence": 0.0}
+            raise AsrError(f"could not decode audio chunk: {e}", retryable=False) from e
 
         headers = {
             "api-subscription-key": self.api_key,
@@ -80,24 +96,22 @@ class SarvamASR:
             "with_diarization": (None, "false"),
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            try:
+        timeout = float(getattr(settings, "asr_timeout_s", 15.0))
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     SARVAM_ASR_URL,
                     headers=headers,
                     files=files,
                 )
-                if resp.status_code not in (200, 201):
-                    logger.error(
-                        "Sarvam ASR error: status=%s body=%s",
-                        resp.status_code,
-                        resp.text[:300],
-                    )
-                    return {"text": "", "speaker": "unknown", "confidence": 0.0}
-                return self._parse_response(resp.json())
-            except Exception as e:
-                logger.error("Sarvam ASR failed: %s", e)
-                return {"text": "", "speaker": "unknown", "confidence": 0.0}
+        except Exception as e:
+            raise AsrError(f"{type(e).__name__}: {e}".strip(), retryable=True) from e
+
+        if resp.status_code not in (200, 201):
+            body = resp.text[:300]
+            retryable = resp.status_code == 429 or resp.status_code >= 500
+            raise AsrError(f"HTTP {resp.status_code}: {body}", retryable=retryable)
+        return self._parse_response(resp.json())
 
     def _parse_response(self, result: dict) -> dict:
         transcript = ""

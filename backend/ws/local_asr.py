@@ -13,6 +13,7 @@ import threading
 from typing import Optional
 
 from config import settings
+from ws.asr import AsrError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ LANG_MAP = {"hi": "hi", "mai": "hi", "mag": "hi", "bho": "hi", "hindi": "hi"}
 class LocalWhisperASR:
     """faster-whisper wrapper — lazy-loaded and thread-safe."""
 
+    name = "local"
+    priority = 90  # the offline fallback: always tried last
+    min_chunk_ms = 0
+
     def __init__(self, model_size: str = "small", device: str = "cpu", compute_type: str = "int8") -> None:
         self.model_size = model_size or getattr(settings, "whisper_model_size", "small")
         self.device = device or getattr(settings, "whisper_device", "cpu")
@@ -43,6 +48,15 @@ class LocalWhisperASR:
     @property
     def _configured(self) -> bool:
         return self.enabled
+
+    @property
+    def available(self) -> bool:
+        # Flips to False once the circuit breaker below trips, so the failover
+        # stops calling a fallback whose weights will never load.
+        return self.enabled
+
+    def supports(self, language: str) -> bool:
+        return False
 
     def _load_model(self):
         if self._model is None:
@@ -160,4 +174,7 @@ class LocalWhisperASR:
                 logger.error(
                     "LocalWhisper transcription failed: %s: %s", type(e).__name__, e
                 )
-            return {"text": "", "speaker": "unknown", "confidence": 0.0}
+            # Not retryable: a missing/undownloadable model fails identically on
+            # every attempt, and the circuit breaker above already handles
+            # repetition across chunks.
+            raise AsrError(f"{type(e).__name__}: {e}".strip(), retryable=False) from e

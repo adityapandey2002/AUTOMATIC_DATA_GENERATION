@@ -21,6 +21,7 @@ import wave
 from typing import Optional
 
 from config import settings
+from ws.asr import AsrError
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,9 @@ SUPPORTED_LANGS = {"mai", "mag", "bho", "vajjika"}
 
 
 class IndicConformerASR:
+    name = "indicconformer"
+    priority = 40
+
     def __init__(self) -> None:
         self.enabled = getattr(settings, "use_indic_conformer", True)
         self.min_chunk_ms = getattr(settings, "min_chunk_ms_for_local_indic", 1000)
@@ -51,6 +55,10 @@ class IndicConformerASR:
     def _configured(self) -> bool:
         return self.enabled and self._nemo_available()
 
+    @property
+    def available(self) -> bool:
+        return self._configured
+
     @staticmethod
     def _nemo_available() -> bool:
         try:
@@ -60,6 +68,8 @@ class IndicConformerASR:
             return False
 
     def supports(self, language: str) -> bool:
+        """IndicConformer is the specialist for the Bihari/Maithili family, so
+        it is promoted ahead of the general providers for those languages."""
         return (language or "").strip().lower() in SUPPORTED_LANGS
 
     def _load_model(self, model_id: str):
@@ -85,7 +95,13 @@ class IndicConformerASR:
         pcm_b64: str,
         language: str = "mai",
         duration_ms: int | None = None,
+        context: str = "",
     ) -> dict:
+        """Transcribe with the local IndicConformer model.
+
+        `context` is accepted for seam uniformity and ignored: this model takes
+        no prompt bias.
+        """
         if not self.enabled:
             return {"text": "", "speaker": "unknown", "confidence": 0.0}
 
@@ -136,5 +152,6 @@ class IndicConformerASR:
                 "language": "maithili",
             }
         except Exception as e:
-            logger.error("IndicConformer transcription failed: %s", e)
-            return {"text": "", "speaker": "unknown", "confidence": 0.0}
+            raise AsrError(
+                f"{type(e).__name__}: {e}".strip(), retryable=False
+            ) from e

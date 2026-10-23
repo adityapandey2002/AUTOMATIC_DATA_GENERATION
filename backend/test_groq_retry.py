@@ -1,4 +1,4 @@
-"""Unit tests for the Groq ASR retry/observability contract.
+"""Unit tests for the Groq ASR adapter's failure classification.
 
 Run:  venv\\Scripts\\python.exe test_groq_retry.py
 
@@ -10,23 +10,19 @@ Why this file exists. A live session logged
     16:21:35 Chunk 3 received
     16:21:54 [ERROR] ws.groq_asr: Groq transcription failed:
 
-and then went silent for the rest of the encounter. Two defects were tangled
-together:
+and then went silent for the rest of the encounter. The adapter used to swallow
+every failure and return an empty result, which lost the chunk for good and
+logged an empty message.
 
-  1. No retry. Every other provider was inert (IndicConformer needs NeMo,
-     Sarvam/Bhashini need keys, local faster-whisper needed a 461MB download),
-     so Groq was the only working engine and a single dropped request lost that
-     chunk for good. Recording continued, transcription did not.
-  2. Undiagnosable logging. `logger.error("...: %s", e)` prints str(e), and
-     several httpx/asyncio exceptions stringify to the empty string -- hence the
-     bare colon above. The exception TYPE is now always included.
+The retry loop itself now lives in the failover module (see
+test_asr_failover.py). The adapter's job is only to *classify* the failure, and
+this file pins that contract:
 
-Covers:
-  * transient failures (timeout, 429, 5xx) are retried and recover
-  * non-transient 4xx is NOT retried (it is a credential/config problem)
-  * retries are bounded and then return the empty result, never a fake one
+  * transient failures (timeout, 429, 5xx) raise AsrError(retryable=True)
+  * non-transient 4xx raises AsrError(retryable=False)
   * an empty-message exception is still labelled with its type
   * the pre-flight short-circuits still make zero network calls
+  * a success returns the parsed result unchanged
 """
 
 from __future__ import annotations
@@ -45,6 +41,7 @@ sys.path.insert(0, str(BACKEND))
 
 from config import settings  # noqa: E402
 from ws import groq_asr  # noqa: E402
+from ws.asr import AsrError  # noqa: E402
 from ws.groq_asr import GroqWhisperASR  # noqa: E402
 
 _results: list[tuple[str, str]] = []
@@ -111,8 +108,12 @@ class _FakeClient:
         return item
 
 
-def _drive(script: list, duration_ms: int = 6000, api_key: str = "gsk_unit_test_key") -> tuple[dict, int, list]:
-    """Run transcribe_chunk against a scripted API and return (result, calls, timeouts)."""
+def _drive(script: list, duration_ms: int = 6000, api_key: str = "gsk_unit_test_key"):
+    """Run ONE adapter call against a scripted API.
+
+    Returns (outcome, calls, timeouts) where outcome is the parsed dict on
+    success, or the AsrError the adapter raised.
+    """
     calls: list[int] = []
     timeouts: list = []
 
@@ -121,9 +122,6 @@ def _drive(script: list, duration_ms: int = 6000, api_key: str = "gsk_unit_test_
         return _FakeClient(script, calls, timeouts)
 
     pcm = b"\x00\x00" * 16000  # 1s of 16k mono s16
-    # Silence the provider logger: on the final attempt groq_asr logs with
-    # exc_info=True, which dumps a full traceback per scripted failure. The
-    # assertions below read the log records, not the console.
     logger = groq_asr.logger
     prev_level, prev_prop = logger.level, logger.propagate
     logger.setLevel(logging.CRITICAL)
@@ -133,84 +131,72 @@ def _drive(script: list, duration_ms: int = 6000, api_key: str = "gsk_unit_test_
         # place before the object is built.
         with mock.patch.object(groq_asr.httpx, "AsyncClient", factory), mock.patch.object(
             settings, "groq_api_key", api_key
-        ), mock.patch.object(settings, "asr_retry_backoff_s", 0.0):
+        ), mock.patch.object(settings, "asr_timeout_s", 15.0):
             asr = GroqWhisperASR()
-            result = asyncio.run(
-                asr.transcribe_chunk(
-                    base64.b64encode(pcm).decode("ascii"), language="hi", duration_ms=duration_ms
+            try:
+                outcome = asyncio.run(
+                    asr.transcribe_chunk(
+                        base64.b64encode(pcm).decode("ascii"),
+                        language="hi",
+                        duration_ms=duration_ms,
+                    )
                 )
-            )
+            except AsrError as e:
+                outcome = e
     finally:
         logger.setLevel(prev_level)
         logger.propagate = prev_prop
-    return result, len(calls), timeouts
+    return outcome, len(calls), timeouts
 
 
 # --- tests -----------------------------------------------------------------
 
-def test_success_first_attempt() -> None:
+def test_success_returns_result() -> None:
     result, calls, _ = _drive([_FakeResponse(200, _OK_BODY)])
     check("happy path: text returned", result["text"], " मेरा नाम शिवानी")
-    check("happy path: one call, no retry", calls, 1)
+    check("happy path: one call", calls, 1)
 
 
-def test_timeout_recovers() -> None:
-    """The reported failure: a slow/dropped request must not lose the chunk."""
-    script = [httpx_read_timeout(), httpx_read_timeout(), _FakeResponse(200, _OK_BODY)]
-    result, calls, _ = _drive(script)
-    check("timeout: chunk recovered", result["text"], " मेरा नाम शिवानी")
-    check("timeout: took 3 attempts", calls, 3)
+def test_timeout_is_retryable() -> None:
+    """The reported failure: a slow/dropped request must be retryable so the
+    failover can give it another go."""
+    err, calls, _ = _drive([httpx_read_timeout()])
+    check("timeout: raises AsrError", isinstance(err, AsrError), True)
+    check("timeout: retryable", err.retryable, True)
+    check("timeout: adapter itself makes one call (retry lives in the module)", calls, 1)
 
 
-def test_rate_limit_retried() -> None:
-    script = [
-        _FakeResponse(429, text="rate_limit_exceeded"),
-        _FakeResponse(429, text="rate_limit_exceeded"),
-        _FakeResponse(200, _OK_BODY),
-    ]
-    result, calls, _ = _drive(script)
-    check("429: retried then recovered", result["text"], " मेरा नाम शिवानी")
-    check("429: took 3 attempts", calls, 3)
+def test_rate_limit_is_retryable() -> None:
+    err, _, _ = _drive([_FakeResponse(429, text="rate_limit_exceeded")])
+    check("429: raises AsrError", isinstance(err, AsrError), True)
+    check("429: retryable", err.retryable, True)
 
 
-def test_server_error_retried() -> None:
-    script = [_FakeResponse(503, text="overloaded"), _FakeResponse(200, _OK_BODY)]
-    result, calls, _ = _drive(script)
-    check("5xx: retried then recovered", result["text"], " मेरा नाम शिवानी")
-    check("5xx: took 2 attempts", calls, 2)
+def test_server_error_is_retryable() -> None:
+    err, _, _ = _drive([_FakeResponse(503, text="overloaded")])
+    check("5xx: retryable", err.retryable, True)
 
 
-def test_client_error_not_retried() -> None:
+def test_client_error_is_not_retryable() -> None:
     """401 will fail identically every time; retrying only wastes the session."""
-    result, calls, _ = _drive([_FakeResponse(401, text="invalid api key")])
-    check("401: returns empty result", result["text"], "")
-    check("401: NOT retried", calls, 1)
-
-
-def test_retries_are_bounded() -> None:
-    result, calls, _ = _drive([httpx_read_timeout()])
-    check("exhausted: empty result, never fabricated text", result["text"], "")
-    check("exhausted: bounded at asr_max_attempts", calls, settings.asr_max_attempts)
-    check("exhausted: confidence is not a fake number", result["confidence"], 0.0)
+    err, calls, _ = _drive([_FakeResponse(401, text="invalid api key")])
+    check("401: raises AsrError", isinstance(err, AsrError), True)
+    check("401: NOT retryable", err.retryable, False)
+    check("401: one call", calls, 1)
 
 
 def test_empty_exception_is_labelled() -> None:
-    """The bare "Groq transcription failed:" line: str(e) was empty.
-
-    The retry must still name the type, otherwise the log is worthless again.
-    """
-    boom = httpx_read_timeout()
-    with mock.patch.object(groq_asr.logger, "error") as err_log, mock.patch.object(
-        groq_asr.logger, "warning"
-    ):
-        _drive([boom, boom, boom])
-    blob = " ".join(str(c) for c in err_log.call_args_list)
-    check("empty-message exception: type is logged", "ReadTimeout" in blob, True)
-    check("empty-message exception: not a bare colon", blob.strip().endswith(":"), False)
+    """The bare "Groq transcription failed:" line: str(e) was empty. The failure
+    must still name the type, otherwise the log is worthless again."""
+    err, _, _ = _drive([httpx_read_timeout()])
+    check("empty-message exception: type is labelled", "ReadTimeout" in str(err), True)
+    check("empty-message exception: message starts with the type", str(err).startswith("ReadTimeout"), True)
+    check("empty-message exception: not empty", str(err).strip() not in ("", ":"), True)
 
 
 def test_timeout_budget_is_bounded() -> None:
-    """A 45s timeout x3 would stall a live encounter for over 2 minutes."""
+    """A 45s timeout would stall a live encounter once; the configured value is
+    the per-attempt budget the module multiplies."""
     _, _, timeouts = _drive([_FakeResponse(200, _OK_BODY)])
     check("per-attempt timeout from settings", timeouts[0], settings.asr_timeout_s)
     check("timeout is not the old 45s", timeouts[0] < 45.0, True)
@@ -224,7 +210,6 @@ def test_short_chunk_makes_no_call() -> None:
 
 def test_unconfigured_makes_no_call() -> None:
     """A placeholder key must short-circuit before any socket is opened."""
-    # .env on a dev box holds a real key, so the placeholder has to be forced.
     result, calls, _ = _drive([_FakeResponse(200, _OK_BODY)], api_key="your_groq_api_key")
     check("placeholder key: empty result", result["text"], "")
     check("placeholder key: zero network calls", calls, 0)
