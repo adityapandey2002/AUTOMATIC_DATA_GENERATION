@@ -133,6 +133,10 @@ def _is_daily_quota_blocked(model: str) -> bool:
 
 
 class GeminiExtractor:
+    # Stable id used in the enrichment module's failure logs (the seam member
+    # every FieldExtractor adapter carries).
+    name = "Gemini"
+
     def __init__(self) -> None:
         self._client = None
         self._model_id = None

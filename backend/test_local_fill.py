@@ -10,8 +10,9 @@ Covers:
   * local_fill bilingual extraction, incl. the Devanagari `BD` boundary
   * the script-fidelity gate (Hinglish must not poison the fields)
   * MergeEngine latest-wins + confirm-lock
-  * ChunkSession._live_window bounding (O(n^2) fix)
-  * _accepts_context provider introspection (TypeError-shim fix)
+  * the enrichment module's bounded live window (O(n^2) fix, now owned by
+    engine/enrichment.py)
+  * the uniform adapter seam (every provider accepts `context`)
   * SessionRegistry convergence (global-session fix)
 """
 
@@ -201,47 +202,57 @@ def test_is_empty() -> None:
 # --- handler-level fixes ---------------------------------------------------
 
 def test_live_window_is_bounded() -> None:
-    from ws.handler import ChunkSession
+    """Windowing moved from ChunkSession into the enrichment module; this test
+    targets the new home and keeps the intent: the live fill scans only the
+    last N chunks, the caller's buffer is never truncated, and finalize still
+    re-scans the FULL transcript."""
+    import asyncio
+
+    from engine.enrichment import Enrichment, OfflineExtractor
+    from engine.merge import MergeEngine
     from config import settings
 
-    s = ChunkSession()
     window = max(1, settings.local_fill_window_chunks)
-    s.transcript_buffer = [f"chunk{i}" for i in range(50)]
-    text = s._live_window()
-    check("live_window: bounded length", len(s.transcript_buffer), 50)
-    check("live_window: only last N chunks", text, " ".join(s.transcript_buffer[-window:]))
-    check("live_window: older chunks excluded", "chunk0" in text, False)
+    chunks = ["उम्र ४२ साल"] + [f"फिलर {i}" for i in range(1, 50)]
+
+    live = Enrichment(MergeEngine(), OfflineExtractor(), window_chunks=window)
+    r = asyncio.run(live.enrich(chunks, "live", chunk_id=0))
+    check("live_window: caller's list not truncated", len(chunks), 50)
+    check("live_window: older chunk outside the window", r.snapshot["answers"]["age"], None)
+
+    final = Enrichment(MergeEngine(), OfflineExtractor(), window_chunks=window)
+    r_full = asyncio.run(final.enrich(chunks, "final"))
+    check("live_window: older chunk included in the final full scan", r_full.snapshot["answers"]["age"], 42)
 
 
-def test_accepts_context_introspection() -> None:
-    from ws.handler import _accepts_context
+def test_adapters_share_one_context_seam() -> None:
+    """Every adapter accepts `context`, so the failover never has to introspect.
+
+    The old `_accepts_context` shim existed only because Sarvam/Bhashini/Indic
+    did not take the kwarg. Making the seam uniform removed that shim and the
+    bug class it caused (swallowing a TypeError raised *inside* an adapter by
+    retrying it with fewer arguments).
+    """
+    import inspect
+
     from ws.groq_asr import GroqWhisperASR
     from ws.local_asr import LocalWhisperASR
     from ws.bhashini_asr import BhashiniASR
     from ws.sarvam_asr import SarvamASR
     from ws.indicconformer_asr import IndicConformerASR
 
-    check("context: groq accepts", _accepts_context(GroqWhisperASR()), True)
-    check("context: local accepts", _accepts_context(LocalWhisperASR()), True)
-    check("context: bhashini rejects", _accepts_context(BhashiniASR()), False)
-    check("context: sarvam rejects", _accepts_context(SarvamASR()), False)
-    check("context: indic rejects", _accepts_context(IndicConformerASR()), False)
+    adapters = [GroqWhisperASR(), LocalWhisperASR(), BhashiniASR(), SarvamASR(), IndicConformerASR()]
+    for adapter in adapters:
+        params = inspect.signature(adapter.transcribe_chunk).parameters
+        check(f"seam: {adapter.name} accepts context", "context" in params, True)
 
-    # A TypeError raised INSIDE the adapter body must no longer be swallowed
-    # and retried with fewer args — it should propagate to the caller's
-    # `except Exception` and be logged.
-    class Boom:
-        def transcribe_chunk(self, pcm_b64, language="hi", duration_ms=None, context=""):
-            raise TypeError("internal bug: unsupported operand")
-
-    from ws.handler import _provider_context_args
-    kwargs = _provider_context_args(Boom(), "ctx")
-    check("context: kwargs built for adapter", "context" in kwargs, True)
-    try:
-        Boom().transcribe_chunk("x", **kwargs)
-        check("context: internal TypeError propagates", "no-raise", "TypeError")
-    except TypeError:
-        check("context: internal TypeError propagates", True, True)
+    # Each adapter also declares the seam's facts, so the module never has to
+    # special-case a provider by name.
+    for adapter in adapters:
+        check(f"seam: {adapter.name} has priority", isinstance(adapter.priority, int), True)
+        check(f"seam: {adapter.name} has min_chunk_ms", isinstance(adapter.min_chunk_ms, int), True)
+        check(f"seam: {adapter.name} has available", isinstance(adapter.available, bool), True)
+        check(f"seam: {adapter.name} has supports", callable(adapter.supports), True)
 
 
 def test_session_registry_convergence() -> None:
@@ -334,15 +345,20 @@ def test_missing_metrics_are_none_not_zero() -> None:
 
 def test_gate_respects_missing_metrics() -> None:
     from ws.handler import ChunkSession
+    from ws.asr import Transcript
 
     s = ChunkSession()
+
+    def t(**kw):
+        return Transcript(text="x", provider="fake", **kw)
+
     # A loud chunk with no metrics must NOT be rejected for low confidence.
-    check("gate: loud + no metrics passes", s._gate_result({}, 0.5), None)
+    check("gate: loud + no metrics passes", s._gate_result(t(), 0.5), None)
     # A genuinely silent chunk is still rejected on RMS alone.
-    check("gate: silent still rejected", s._gate_result({}, 0.0), "rejected")
+    check("gate: silent still rejected", s._gate_result(t(), 0.0), "rejected")
     # Real bad metrics still trip.
-    check("gate: low logprob dropped", s._gate_result({"avg_logprob": -3.0}, 0.5), "dropped")
-    check("gate: high no_speech rejected", s._gate_result({"no_speech_prob": 0.9}, 0.5), "rejected")
+    check("gate: low logprob dropped", s._gate_result(t(avg_logprob=-3.0), 0.5), "dropped")
+    check("gate: high no_speech rejected", s._gate_result(t(no_speech_prob=0.9), 0.5), "rejected")
 
 
 def test_echo_threshold_tradeoff() -> None:
