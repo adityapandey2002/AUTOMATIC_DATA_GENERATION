@@ -1,30 +1,39 @@
 """WebSocket handlers — audio chunks, dashboard control, live broadcasting.
 
-- /ws/chunks    : capture agent streams PCM chunks; the backend runs
-                  ASR -> Q&A form extraction -> merge -> broadcast.
-- /ws/dashboard : health-worker UI. Receives live transcript + form updates.
-                  Sends mic_start / mic_stop / set_field / save commands.
+- /ws/chunks    : capture agents (or the browser microphone) stream PCM
+                  chunks; the backend runs ASR -> one enrichment round
+                  (extraction -> merge -> validate, engine/enrichment.py)
+                  -> broadcast.
+- /ws/dashboard : health-worker UI. Receives live transcript + form updates;
+                  sends recording/edit/save commands.
+
+Every message on this seam is built and parsed by ws/protocol.py — the module
+that owns the wire contract. This handler decides WHICH behavior runs at each
+branch; the protocol module owns WHAT the message looks like:
+
+- backend -> client events go out only through the protocol constructors;
+- client -> backend commands come in only through the protocol parsers.
 
 Auto-filled fields land directly in the sheet (no per-field confirm).
-Manual cell edits (set_field) lock the value against ASR overwrite.
+Manual cell edits via the edit command lock the value against ASR overwrite.
 """
 
 from __future__ import annotations
 
 import array
 import base64
-import inspect
 import json
 import logging
 import math
 import re
 import uuid
-from datetime import datetime
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from config import settings
+from ws import protocol
+from ws.asr import AsrFailover, Transcript
 from ws.sarvam_asr import SarvamASR
 from ws.bhashini_asr import BhashiniASR
 from ws.local_asr import LocalWhisperASR
@@ -33,45 +42,11 @@ from ws.indicconformer_asr import IndicConformerASR
 from llm.extract import GeminiExtractor
 from engine.merge import MergeEngine
 from engine.validate import validate_case_sheet
-from engine.local_fill import local_fill
+from engine.enrichment import Enrichment, FieldExtractor, OfflineExtractor
 from db.connection import SessionLocal
-from db.models import Encounter, Utterance, VitalsSnapshot, Alert, Patient
-from sqlalchemy import delete as sa_delete
-from storage.audio import log_deletion
+from db.repository import EncounterRepository
 
 logger = logging.getLogger(__name__)
-
-
-def _accepts_context(provider) -> bool:
-    """Whether this provider's transcribe_chunk() takes a `context` kwarg.
-
-    Only Groq and local faster-whisper use the prompt-context carry; the
-    Sarvam/Bhashini/IndicConformer adapters do not. We introspect the signature
-    once per provider class instead of catching TypeError, which used to also
-    swallow genuine TypeErrors raised *inside* a provider body and silently
-    retry it with fewer arguments — turning a real bug into a no-op.
-    """
-    try:
-        params = inspect.signature(provider.transcribe_chunk).parameters
-    except (TypeError, ValueError):  # pragma: no cover - builtins/C-extensions
-        return False
-    if "context" in params:
-        return True
-    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-
-# Cache of provider class -> bool, so the signature is inspected once per class
-# rather than once per chunk per provider.
-_CONTEXT_SUPPORT: dict[type, bool] = {}
-
-
-def _provider_context_args(provider, context: str) -> dict:
-    cls = type(provider)
-    supported = _CONTEXT_SUPPORT.get(cls)
-    if supported is None:
-        supported = _accepts_context(provider)
-        _CONTEXT_SUPPORT[cls] = supported
-    return {"context": context} if supported else {}
 
 
 # --- Prompt-echo (hallucination) detection --------------------------------
@@ -172,14 +147,37 @@ def is_prompt_echo(
 
 
 class ChunkSession:
-    def __init__(self) -> None:
-        self.groq = GroqWhisperASR()
-        self.indic = IndicConformerASR()
-        self.sarvam = SarvamASR()
-        self.bhashini = BhashiniASR()
-        self.local_asr = LocalWhisperASR()
-        self.extractor = GeminiExtractor()
+    def __init__(self, repository: Optional[EncounterRepository] = None) -> None:
+        # The five adapters are injected into the failover module; its seam is
+        # the only thing this session depends on. Ordering, context passing,
+        # availability, the min-chunk policy, and retry all live in the module.
+        self.asr = AsrFailover.from_settings([
+            GroqWhisperASR(),
+            SarvamASR(),
+            BhashiniASR(),
+            IndicConformerASR(),
+            LocalWhisperASR(),
+        ])
         self.merge = MergeEngine()
+        # The enrichment module's extraction adapter is INJECTED, never
+        # constructed by the module: real Gemini when it is enabled, the
+        # offline adapter (which contributes nothing) for zero-cost / offline
+        # mode. The module owns which transcript is scanned, the merge order,
+        # the LLM seam, and validation on top of them.
+        extractor: FieldExtractor = (
+            GeminiExtractor() if settings.llm_final_extract else OfflineExtractor()
+        )
+        self.sheet = Enrichment(
+            self.merge,
+            extractor,
+            window_chunks=settings.local_fill_window_chunks,
+        )
+        # Persistence is one injected encounter repository (db/repository.py,
+        # itself bound to an injected session factory). Default: the real one
+        # over the configured SessionLocal, so existing construction sites
+        # (SessionRegistry, the offline tests) keep working without new
+        # wiring; tests inject a repository bound to their own SQLite factory.
+        self.repository = repository if repository is not None else EncounterRepository(SessionLocal)
         self.encounter_id: str = ""
         self.chunk_ids: list[int] = []
         self.transcript_buffer: list[str] = []
@@ -209,13 +207,6 @@ class ChunkSession:
         if len(self._echo_transcripts) > 50:
             self._echo_transcripts.clear()
         self._echo_transcripts.add(_echo_norm(transcript))
-
-    def _provider_order(self, language: str) -> list:
-        """Order ASR providers by best-fit for the spoken language."""
-        lang_key = (language or "").strip().lower()
-        if self.indic.supports(lang_key):
-            return [self.indic, self.groq, self.sarvam, self.bhashini, self.local_asr]
-        return [self.groq, self.sarvam, self.bhashini, self.indic, self.local_asr]
 
     def _prompt_context(self, language: str) -> str:
         """Build Whisper prompt = tail of previous transcript + domain vocab last.
@@ -251,14 +242,14 @@ class ChunkSession:
             strip = 1
         return " ".join(new_words[strip:]) if strip else new
 
-    def _gate_result(self, asr_result: dict, pcm_level: float) -> Optional[str]:
+    def _gate_result(self, asr_result: Transcript, pcm_level: float) -> Optional[str]:
         """Return None if chunk is usable; else 'rejected' (silence) or 'dropped'
         (hallucination/low-confidence). Confidence metrics only exist for some
         providers (local faster-whisper); the RMS gate works for all (incl.
         Groq, which does not expose no_speech_prob)."""
-        no_speech = asr_result.get("no_speech_prob")
-        compression = asr_result.get("compression_ratio")
-        avg_logprob = asr_result.get("avg_logprob")
+        no_speech = asr_result.no_speech_prob
+        compression = asr_result.compression_ratio
+        avg_logprob = asr_result.avg_logprob
 
         # Silence detected either by the provider metric or by PCM energy.
         if no_speech is not None and no_speech > settings.no_speech_prob_threshold:
@@ -270,18 +261,6 @@ class ChunkSession:
         if avg_logprob is not None and avg_logprob < settings.avg_logprob_floor:
             return "dropped"
         return None
-
-    def _live_window(self) -> str:
-        """Transcript tail used for the per-chunk local fill.
-
-        Bounded to the last N chunks so the ~30 regex passes in local_fill()
-        don't re-scan the whole encounter on every chunk. MergeEngine keeps
-        anything found in older chunks, so narrowing the window only limits
-        how far back a *correction* can be picked up live — finalize() re-scans
-        the full transcript regardless.
-        """
-        window = max(1, settings.local_fill_window_chunks)
-        return " ".join(self.transcript_buffer[-window:])
 
     async def process_chunk(self, payload: dict, pcm_level: Optional[float] = None) -> Optional[dict]:
         if not self.active:
@@ -315,61 +294,44 @@ class ChunkSession:
             pcm_level,
         )
 
-        empty_payload = {
-            "type": "chunk_result",
-            "chunk_id": chunk_id,
-            "encounter_id": self.encounter_id,
-            "transcript": "",
-            "status": "rejected",
-            "speaker": "unknown",
-            "language": "",
-            "answers": self.merge.get_snapshot()["answers"],
-            "confirmed": self.merge.get_snapshot()["_confirmed"],
-            "alerts": [],
-        }
+        empty_payload = protocol.chunk_result(
+            chunk_id=chunk_id,
+            encounter_id=self.encounter_id,
+            transcript="",
+            status=protocol.STATUS_REJECTED,
+            speaker="unknown",
+            language="",
+            answers=self.merge.get_snapshot()["answers"],
+            confirmed=self.merge.get_snapshot()["_confirmed"],
+            alerts=[],
+        )
 
         # Cheap pre-ASR silence gate: don't burn a cloud call on quiet/noise.
         if not pcm_b64 or pcm_level < settings.min_pcm_level_for_speech:
             return empty_payload
 
-        transcript = ""
-        asr_result: dict = {"speaker": "unknown", "language": ""}
-        provider_name = ""
-
-        for provider in self._provider_order(language):
-            try:
-                result = await provider.transcribe_chunk(
-                    pcm_b64,
-                    language=language,
-                    duration_ms=duration_ms,
-                    **_provider_context_args(provider, context),
-                )
-            except Exception as e:
-                # Real errors (including TypeErrors from inside the adapter)
-                # now surface here instead of being masked by a retry shim.
-                logger.warning(
-                    "%s failed for chunk %d: %s",
-                    type(provider).__name__,
-                    chunk_id,
-                    e,
-                )
-                continue
-
-            if result and result.get("text"):
-                transcript = result["text"]
-                asr_result = result
-                provider_name = type(provider).__name__
-                logger.info(
-                    "Chunk %d ASR ok via %s (dur=%dms): %r",
-                    chunk_id,
-                    provider_name,
-                    duration_ms,
-                    transcript[:100],
-                )
-                break
-
-        if not transcript:
+        # The ASR failover module owns provider ordering, context passing,
+        # availability, the min-chunk policy, and retry of transient failures.
+        # It returns one normalised transcript, or None if nothing could serve
+        # this chunk.
+        asr_result = await self.asr.transcribe(
+            pcm_b64,
+            language=language,
+            duration_ms=duration_ms,
+            context=context,
+        )
+        if asr_result is None:
             return empty_payload
+
+        transcript = asr_result.text
+        provider_name = asr_result.provider
+        logger.info(
+            "Chunk %d ASR ok via %s (dur=%dms): %r",
+            chunk_id,
+            provider_name,
+            duration_ms,
+            transcript[:100],
+        )
 
         # Post-ASR gating: silence / hallucination should never reach the sheet.
         gate = self._gate_result(asr_result, pcm_level)
@@ -384,7 +346,7 @@ class ChunkSession:
             )
             return empty_payload
         if gate == "dropped":
-            logprob = asr_result.get("avg_logprob")
+            logprob = asr_result.avg_logprob
             logger.info(
                 "Chunk %d dropped (low confidence, %s avg_logprob=%.2f): %r",
                 chunk_id,
@@ -418,159 +380,71 @@ class ChunkSession:
             return empty_payload
 
         tentative = bool(
-            asr_result.get("avg_logprob") is not None
-            and asr_result.get("avg_logprob") < settings.avg_logprob_tentative
+            asr_result.avg_logprob is not None
+            and asr_result.avg_logprob < settings.avg_logprob_tentative
         )
 
         self.transcript_buffer.append(transcript)
         self._remember(transcript)
 
-        # Per-chunk: free local bilingual field filler (instant, no API quota).
-        # Scoped to a bounded tail window — see _live_window().
-        filled = local_fill(self._live_window())
-        self.merge.merge(filled, chunk_id)
-        snapshot = self.merge.get_snapshot()
-        validation_alerts = validate_case_sheet(snapshot)
+        # One enrichment round: the module owns the bounded live window, the
+        # local-fill merge, and validation. Live mode never calls the LLM.
+        result = await self.sheet.enrich(self.transcript_buffer, "live", chunk_id=chunk_id)
 
-        return {
-            "type": "chunk_result",
-            "chunk_id": chunk_id,
-            "encounter_id": self.encounter_id,
-            "transcript": transcript,
-            "status": "tentative" if tentative else "finalized",
-            "confidence": asr_result.get("avg_logprob"),
-            "provider": provider_name,
-            "speaker": asr_result.get("speaker", "unknown"),
-            "language": asr_result.get("language", ""),
-            "answers": snapshot["answers"],
-            "confirmed": snapshot["_confirmed"],
-            "alerts": [{"field": a.field, "message": a.message, "severity": a.severity} for a in validation_alerts],
-        }
+        return protocol.chunk_result(
+            chunk_id=chunk_id,
+            encounter_id=self.encounter_id,
+            transcript=transcript,
+            status=protocol.STATUS_TENTATIVE if tentative else protocol.STATUS_FINALIZED,
+            confidence=asr_result.avg_logprob,
+            provider=provider_name,
+            speaker=asr_result.speaker,
+            language=asr_result.language,
+            answers=result.snapshot["answers"],
+            confirmed=result.snapshot["_confirmed"],
+            alerts=[{"field": a.field, "message": a.message, "severity": a.severity} for a in result.alerts],
+        )
 
     async def finalize(self) -> dict:
         full_transcript = " ".join(self.transcript_buffer)
 
-        # Free local fill always runs first — fields already set locally stay.
-        # NOTE: deliberately the FULL transcript, not the live window. This is
-        # the one pass that can pair a question in one chunk with its answer in
-        # another, and it runs once per patient, so the cost is irrelevant.
-        filled = local_fill(full_transcript)
-        self.merge.merge(filled, -1)
+        # One enrichment round for the whole encounter. The module owns which
+        # transcript is scanned (deliberately the FULL one — the only pass that
+        # can pair a question in one chunk with its answer in another), the
+        # local fill -> extractor merge order, and validation.
+        result = await self.sheet.enrich(self.transcript_buffer, "final")
+        snapshot = result.snapshot
+        validation_alerts = result.alerts
 
-        # Gemini cleans up the ambiguous leftovers — ONE call per patient.
-        if settings.llm_final_extract and full_transcript.strip():
-            try:
-                extracted = await self.extractor.extract(full_transcript)
-                self.merge.merge(extracted, -1)
-            except Exception as e:
-                logger.warning("Gemini final extraction failed (local fill kept): %s", e)
-
-        snapshot = self.merge.get_snapshot()
-        validation_alerts = validate_case_sheet(snapshot)
-
-        db = SessionLocal()
-        try:
-            self._persist(db, snapshot, validation_alerts)
-            if settings.audio_delete_after_transcribe:
-                log_deletion(db, self.encounter_id, self.chunk_ids)
-        finally:
-            db.close()
+        # The encounter repository owns the idempotent replace, the
+        # answers -> Patient mapping, and the DPDP deletion-audit row. This
+        # caller owns the audio-deletion POLICY: this save deletes the streamed
+        # audio only when the config says so, which is what turns the audit on.
+        outcome = self.repository.save(
+            encounter_id=self.encounter_id,
+            transcript=self.transcript_buffer,
+            snapshot=snapshot,
+            alerts=validation_alerts,
+            deleted_chunk_ids=(
+                self.chunk_ids if settings.audio_delete_after_transcribe else None
+            ),
+        )
+        self.encounter_id = outcome.encounter_id
 
         self.active = False
-        return {
-            "type": "finalize_result",
-            "encounter_id": self.encounter_id,
-            "transcript": full_transcript,
-            "answers": snapshot["answers"],
-            "confirmed": snapshot["_confirmed"],
-            "alerts": [{"field": a.field, "message": a.message, "severity": a.severity} for a in validation_alerts],
-        }
+        return protocol.finalize_result(
+            encounter_id=self.encounter_id,
+            transcript=full_transcript,
+            answers=snapshot["answers"],
+            confirmed=snapshot["_confirmed"],
+            alerts=[{"field": a.field, "message": a.message, "severity": a.severity} for a in validation_alerts],
+        )
 
     def confirm(self, field_name: str) -> bool:
         return self.merge.confirm(field_name)
 
     def set_field(self, field_name: str, value) -> bool:
         return self.merge.set_field(field_name, value)
-
-    def _patient_from_answers(self, answers: dict, encounter_id: str) -> Patient:
-        def s(key):
-            v = answers.get(key)
-            if v is None:
-                return None
-            if isinstance(v, list):
-                return ", ".join(str(x) for x in v)
-            return str(v)
-
-        age_raw = answers.get("age")
-        age_val = None
-        if age_raw not in (None, ""):
-            try:
-                age_val = int(float(str(age_raw).strip()))
-            except (TypeError, ValueError):
-                age_val = None
-
-        return Patient(
-            encounter_id=encounter_id,
-            name=s("name"),
-            age=age_val,
-            language=None,
-            spouse_parent_of=s("spouse_parent_of"),
-            contact_phone=s("contact_phone"),
-            address=s("address"),
-            district=s("district"),
-            block=s("block"),
-            health_centre=s("health_centre"),
-            answers={k: v for k, v in answers.items() if v is not None},
-            saved_at=datetime.utcnow(),
-        )
-
-    def _persist(self, db, snapshot: dict, alerts) -> None:
-        # Idempotent: a repeat finalize/save (same encounter_id) replaces old rows.
-        if self.encounter_id:
-            for model in (Utterance, VitalsSnapshot, Alert, Patient, Encounter):
-                db.execute(sa_delete(model).where(model.encounter_id == self.encounter_id) if hasattr(model, "encounter_id") else sa_delete(model).where(model.id == self.encounter_id))
-        encounter = Encounter(id=self.encounter_id or None)
-        db.add(encounter)
-        db.flush()
-        self.encounter_id = encounter.id
-
-        for i, text in enumerate(self.transcript_buffer):
-            db.add(Utterance(
-                encounter_id=encounter.id,
-                chunk_id=i,
-                speaker="mixed",
-                transcript=text,
-            ))
-
-        db.add(VitalsSnapshot(
-            encounter_id=encounter.id,
-            data={
-                "answers": snapshot["answers"],
-                "confirmed": snapshot["_confirmed"],
-            },
-            confirmed=False,
-        ))
-
-        answers = snapshot["answers"]
-        patient = self._patient_from_answers(answers, encounter.id)
-        db.add(patient)
-
-        for alert in alerts:
-            db.add(Alert(
-                encounter_id=encounter.id,
-                field=alert.field,
-                message=alert.message,
-                severity=alert.severity,
-            ))
-
-        db.commit()
-        logger.info(
-            "Persisted encounter %s (patient %s) with %d utterances",
-            encounter.id,
-            patient.id,
-            len(self.transcript_buffer),
-        )
-        return patient
 
 
 # --- Connection registries -------------------------------------------------
@@ -661,10 +535,9 @@ def _pcm_level(pcm_b64: str) -> float:
 
 
 async def broadcast_capture_status() -> None:
-    await broadcast_to_dashboard({
-        "type": "capture_status",
-        "connected": bool(capture_clients),
-    })
+    await broadcast_to_dashboard(
+        protocol.capture_status(connected=bool(capture_clients))
+    )
 
 
 async def broadcast_to_dashboard(message: dict) -> None:
@@ -691,26 +564,29 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            message = protocol.parse_chunks_message(data)
 
-            incoming_id = str(data.get("encounter_id") or "").strip()
-
-            if data.get("type") == "finalize":
-                session = session or sessions.resolve(incoming_id)
-                if incoming_id:
-                    session.encounter_id = incoming_id
+            if isinstance(message, protocol.Finalize):
+                session = session or sessions.resolve(message.encounter_id)
+                if message.encounter_id:
+                    session.encounter_id = message.encounter_id
                 result = await session.finalize()
                 await websocket.send_text(json.dumps(result))
                 await broadcast_to_dashboard(result)
                 session.active = False
                 break
 
-            if data.get("type") == "session_start":
-                session = sessions.resolve(incoming_id)
+            if isinstance(message, protocol.SessionStart):
+                session = sessions.resolve(message.encounter_id)
                 session.active = True
-                session.reset(session.encounter_id or incoming_id)
+                session.reset(session.encounter_id or message.encounter_id)
                 sessions.set_active(session)
-                await broadcast_to_dashboard({"type": "session_state", "active": True, "encounter_id": session.encounter_id})
+                await broadcast_to_dashboard(
+                    protocol.session_state(active=True, encounter_id=session.encounter_id)
+                )
                 continue
+
+            incoming_id = message.encounter_id
 
             # Re-resolve if this payload names a different encounter than the
             # one we were already filling (e.g. a browser-mic run switching id).
@@ -721,31 +597,30 @@ async def ws_chunks_handler(websocket: WebSocket) -> None:
                 sessions.set_active(session)
 
             # First audio chunk implicitly starts the session (the capture agent
-            # does not send session_start), so chunks are never dropped.
+            # does not send the start command), so chunks are never dropped.
             if not session.active:
                 session.active = True
                 session.reset(session.encounter_id)
-                await broadcast_to_dashboard({
-                    "type": "session_state",
-                    "active": True,
-                    "encounter_id": session.encounter_id,
-                })
+                await broadcast_to_dashboard(
+                    protocol.session_state(active=True, encounter_id=session.encounter_id)
+                )
 
             # One RMS pass, reused for the voice-activity broadcast AND the
             # in-handler silence gate.
-            voice_level = _pcm_level(data.get("pcm_b64", ""))
-            await broadcast_to_dashboard({
-                "type": "voice_activity",
-                "level": voice_level,
-                "encounter_id": session.encounter_id,
-            })
+            voice_level = _pcm_level(message.payload.get("pcm_b64", ""))
+            await broadcast_to_dashboard(
+                protocol.voice_activity(level=voice_level, encounter_id=session.encounter_id)
+            )
 
-            result = await session.process_chunk(data, pcm_level=voice_level)
+            result = await session.process_chunk(message.payload, pcm_level=voice_level)
             if result is None:
                 # Not recording — drain silently so the agent keeps its socket.
                 continue
-            result["voice_level"] = voice_level
-            result["vad"] = 1.0 if voice_level > 0.02 else 0.0
+            result = protocol.attach_voice(
+                result,
+                voice_level=voice_level,
+                vad=1.0 if voice_level > 0.02 else 0.0,
+            )
             await websocket.send_text(json.dumps(result))
             await broadcast_to_dashboard(result)
 
@@ -772,94 +647,87 @@ async def ws_dashboard_handler(websocket: WebSocket) -> None:
         if active is not None:
             snapshot = active.merge.get_snapshot()
             if active.active:
-                await websocket.send_text(json.dumps({
-                    "type": "session_state",
-                    "active": True,
-                    "encounter_id": active.encounter_id,
-                }))
-            await websocket.send_text(json.dumps({
-                "type": "snapshot",
-                "answers": snapshot["answers"],
-                "confirmed": snapshot["_confirmed"],
-                "transcript": " ".join(active.transcript_buffer[-8:]),
-            }))
+                await websocket.send_text(json.dumps(
+                    protocol.session_state(active=True, encounter_id=active.encounter_id)
+                ))
+            await websocket.send_text(json.dumps(protocol.snapshot(
+                answers=snapshot["answers"],
+                confirmed=snapshot["_confirmed"],
+                transcript=" ".join(active.transcript_buffer[-8:]),
+            )))
         await broadcast_capture_status()
 
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
-            msg_type = data.get("type")
+            command = protocol.parse_command(data)
 
-            if msg_type == "mic_start":
-                requested = str(data.get("encounter_id") or "").strip()
-                session = sessions.resolve(requested)
+            if isinstance(command, protocol.MicStart):
+                session = sessions.resolve(command.encounter_id)
                 # Only reset a session that isn't already recording. Previously
                 # this unconditionally called reset(), so a health worker
-                # clicking "Start" while the capture agent was streaming wiped
-                # the in-progress transcript.
+                # starting a recording while the capture agent was streaming
+                # wiped the in-progress transcript.
                 if not session.active:
                     session.active = True
-                    session.reset(requested or session.encounter_id)
+                    session.reset(command.encounter_id or session.encounter_id)
                 sessions.set_active(session)
                 logger.info("Recording started (encounter %s)", session.encounter_id)
-                await broadcast_to_dashboard({
-                    "type": "session_state",
-                    "active": True,
-                    "encounter_id": session.encounter_id,
-                })
+                await broadcast_to_dashboard(
+                    protocol.session_state(active=True, encounter_id=session.encounter_id)
+                )
 
-            elif msg_type == "mic_stop":
+            elif isinstance(command, protocol.MicStop):
                 session = sessions.active
                 if session and session.active:
                     result = await session.finalize()
                     await broadcast_to_dashboard(result)
                 else:
-                    await broadcast_to_dashboard({"type": "session_state", "active": False})
+                    await broadcast_to_dashboard(protocol.session_state(active=False))
 
-            elif msg_type == "set_field":
-                field = data.get("field", "")
-                value = data.get("value")
+            elif isinstance(command, protocol.SetField):
                 session = sessions.active or sessions.resolve()
-                if session.set_field(field, value):
+                if session.set_field(command.field, command.value):
                     snapshot = session.merge.get_snapshot()
-                    await broadcast_to_dashboard({
-                        "type": "field_updated",
-                        "field": field,
-                        "value": value,
-                        "answers": snapshot["answers"],
-                    })
+                    await broadcast_to_dashboard(protocol.field_updated(
+                        field=command.field,
+                        value=command.value,
+                        answers=snapshot["answers"],
+                    ))
 
-            elif msg_type == "save":
+            elif isinstance(command, protocol.Save):
                 session = sessions.active or sessions.resolve()
                 if not session.encounter_id:
                     session.encounter_id = str(uuid.uuid4())
                     sessions.set_active(session)
                 snapshot = session.merge.get_snapshot()
                 validation_alerts = validate_case_sheet(snapshot)
-                db = SessionLocal()
-                try:
-                    patient = session._persist(db, snapshot, validation_alerts)
-                    patient_id = patient.id if patient else None
-                    encounter_id = session.encounter_id
-                finally:
-                    db.close()
-                await broadcast_to_dashboard({
-                    "type": "save_result",
-                    "ok": True,
-                    "encounter_id": encounter_id,
-                    "patient_id": patient_id,
-                    "answers": snapshot["answers"],
-                })
+                # Same encounter repository as finalize. This save deletes no
+                # audio, so no deleted_chunk_ids — the audit policy is the
+                # caller's, and this caller deletes nothing.
+                outcome = session.repository.save(
+                    encounter_id=session.encounter_id,
+                    transcript=session.transcript_buffer,
+                    snapshot=snapshot,
+                    alerts=validation_alerts,
+                )
+                session.encounter_id = outcome.encounter_id
+                await broadcast_to_dashboard(protocol.save_result(
+                    ok=True,
+                    encounter_id=outcome.encounter_id,
+                    patient_id=outcome.patient_id,
+                    answers=snapshot["answers"],
+                ))
 
-            elif msg_type == "confirm_field":
-                # Kept for wire compatibility; UI no longer sends this.
-                field = data.get("field", "")
+            elif isinstance(command, protocol.ConfirmField):
+                # No client sends this today. Kept first-class: the
+                # clinician-facing confirm affordance is an open product
+                # decision (see ws/protocol.py, ConfirmField).
                 session = sessions.active
-                if session and session.confirm(field):
-                    await broadcast_to_dashboard({
-                        "type": "field_confirmed",
-                        "field": field,
-                    })
+                if session and session.confirm(command.field):
+                    await broadcast_to_dashboard(
+                        protocol.field_confirmed(field=command.field)
+                    )
 
     except WebSocketDisconnect:
         pass
