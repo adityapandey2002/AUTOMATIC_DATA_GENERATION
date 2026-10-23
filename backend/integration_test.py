@@ -10,6 +10,18 @@ import time
 import httpx
 import websockets
 
+# The wire names come from the protocol module — the backend's one owner of
+# every message shape — so this suite cannot drift from what the handlers
+# branch on. (Needs to run from backend/ or with backend/ importable, as any
+# script that touches the backend does.)
+from ws.protocol import (  # noqa: E402
+    CHUNK_RESULT,
+    MIC_START,
+    MIC_STOP,
+    SESSION_START,
+    SESSION_STATE,
+)
+
 # Point at an isolated instance to test without disturbing a live encounter:
 #   SCRIBE_TEST_PORT=8766, with the backend started using a separate
 #   DATABASE_URL (e.g. sqlite:///./test_scribe.db). Defaults to the
@@ -35,23 +47,23 @@ async def test_rest():
 async def test_dashboard_ws():
     async with websockets.connect(WS_DASH, open_timeout=5) as ws:
         # Connect handler may push capture_status/snapshot first — drain until mic_start ack.
-        await ws.send(json.dumps({"type": "mic_start", "encounter_id": "it-dash"}))
+        await ws.send(json.dumps({"type": MIC_START, "encounter_id": "it-dash"}))
         resp = None
         deadline = time.time() + 5
         while time.time() < deadline:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=deadline - time.time()))
-            if msg.get("type") == "session_state":
+            if msg.get("type") == SESSION_STATE:
                 resp = msg
                 break
         assert resp is not None, "no session_state received after mic_start"
         assert resp.get("active") is True
-        await ws.send(json.dumps({"type": "mic_stop"}))
+        await ws.send(json.dumps({"type": MIC_STOP}))
         return f"WS {WS_DASH} mic_start/mic_stop round-trip OK"
 
 
 async def test_chunks_ws():
     async with websockets.connect(WS_CHUNKS, open_timeout=5) as ws:
-        await ws.send(json.dumps({"type": "session_start", "encounter_id": "it-chunks"}))
+        await ws.send(json.dumps({"type": SESSION_START, "encounter_id": "it-chunks"}))
         silence = base64.b64encode(b"\x00\x00" * 1600).decode("ascii")
         payload = {
             "chunk_id": 0,
@@ -68,7 +80,7 @@ async def test_chunks_ws():
         try:
             resp = await asyncio.wait_for(ws.recv(), timeout=15)
             data = json.loads(resp)
-            assert data.get("type") == "chunk_result", f"unexpected type {data.get('type')}"
+            assert data.get("type") == CHUNK_RESULT, f"unexpected type {data.get('type')}"
             assert "answers" in data and "confirmed" in data, "missing answers/confirmed"
             return f"WS {WS_CHUNKS} chunk round-trip OK (answers={sum(v is not None for v in data['answers'].values())} fields)"
         except asyncio.TimeoutError:

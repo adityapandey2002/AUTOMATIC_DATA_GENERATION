@@ -21,6 +21,12 @@ export default function App() {
   const [schema, setSchema] = useState(FORM_SCHEMA);
   const [messages, setMessages] = useState([]);
   const [answers, setAnswers] = useState({});
+  // Per-field human-confirm locks. The backend owns this state: every
+  // authoritative broadcast (snapshot / chunk_result / finalize_result) carries
+  // a full `confirmed` map next to `answers`, and a `field_updated` echo
+  // implies the edited cell is locked (backend set_field writes the lock).
+  // The UI only renders it; nothing here sends a confirm command.
+  const [confirmed, setConfirmed] = useState({});
   const [alerts, setAlerts] = useState([]);
   const [recording, setRecording] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
@@ -100,6 +106,7 @@ export default function App() {
       if (lastMessage.active) {
         setMessages([]);
         setAnswers({});
+        setConfirmed({});
         setAlerts([]);
         setStartedAt(Date.now());
         setSaveStatus("");
@@ -108,6 +115,7 @@ export default function App() {
 
     if (lastMessage.type === "snapshot") {
       if (lastMessage.answers) setAnswers(lastMessage.answers);
+      if (lastMessage.confirmed) setConfirmed(lastMessage.confirmed);
       if (Array.isArray(lastMessage.transcript)) {
         setMessages((prev) => [...prev, ...lastMessage.transcript]);
       } else if (lastMessage.transcript) {
@@ -116,7 +124,10 @@ export default function App() {
     }
 
     if (lastMessage.type === "chunk_result") {
-      if (lastMessage.transcript && lastMessage.status !== "rejected" && lastMessage.status !== "empty") {
+      // `empty` is not a wire status (the protocol module's canonical three are
+      // rejected / tentative / finalized) — the backend never sends it, so only
+      // the rejected guard remains.
+      if (lastMessage.transcript && lastMessage.status !== "rejected") {
         setMessages((prev) => [
           ...prev,
           {
@@ -128,15 +139,22 @@ export default function App() {
         ]);
       }
       if (lastMessage.answers) setAnswers(lastMessage.answers);
+      if (lastMessage.confirmed) setConfirmed(lastMessage.confirmed);
       if (lastMessage.alerts?.length) setAlerts(lastMessage.alerts);
     }
 
     if (lastMessage.type === "field_updated") {
       if (lastMessage.answers) setAnswers(lastMessage.answers);
+      // Backend broadcasts field_updated only after a successful set_field,
+      // and set_field locks the cell against later auto-fill
+      // (backend/engine/merge.py, MergeEngine.set_field → confirmed=True).
+      // Mirror that lock locally until the next full `confirmed` map arrives.
+      setConfirmed((prev) => ({ ...prev, [lastMessage.field]: true }));
     }
 
     if (lastMessage.type === "finalize_result") {
       setAnswers(lastMessage.answers || {});
+      setConfirmed(lastMessage.confirmed || {});
       setAlerts(lastMessage.alerts || []);
       setRecording(false);
       setStartedAt(null);
@@ -330,6 +348,7 @@ export default function App() {
             <CaseSheetForm
               schema={schema}
               answers={answers}
+              confirmed={confirmed}
               onEdit={handleEdit}
               onSave={handleSave}
               saving={saving}
