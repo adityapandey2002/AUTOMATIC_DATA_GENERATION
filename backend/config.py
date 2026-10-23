@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     no_speech_prob_threshold: float = 0.6
     avg_logprob_tentative: float = -1.0
     avg_logprob_floor: float = -1.5
-    compression_ratio_threshold: float = 2.4
+    compression_ratio_threshold: float = 3.0
 
     # Server-side speech gate (works for all providers, incl. Groq which does
     # not expose no_speech_prob): a chunk whose RMS voice level is below this
